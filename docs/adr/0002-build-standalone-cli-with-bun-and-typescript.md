@@ -1,0 +1,3 @@
+# Build the standalone CLI with Bun and TypeScript
+
+The CLI and Worker will both use TypeScript, with Commander for CLI parsing and Bun compiling standalone executables for macOS and glibc Linux on x64 and arm64. This keeps one language and shared protocol types without requiring Publishers to install a runtime; Go would simplify native releases but split the implementation languages, while distributing Node source would weaken the installation experience. Native credential-store packaging and smoke tests are required on every release target because successful cross-compilation alone does not prove that the target-specific addon was embedded.
