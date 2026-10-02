@@ -1,4 +1,8 @@
-import { AsyncEntry } from "@napi-rs/keyring";
+import type { AsyncEntry as AsyncEntryType } from "@napi-rs/keyring";
+
+const { AsyncEntry } = require("@napi-rs/keyring") as {
+  readonly AsyncEntry: typeof AsyncEntryType;
+};
 
 const SERVICE_NAME = "arty";
 
@@ -12,7 +16,7 @@ export interface CredentialStore {
   readonly set: (account: string, value: string) => Promise<void>;
 }
 
-const entryFor = (account: string): AsyncEntry =>
+const entryFor = (account: string): AsyncEntryType =>
   new AsyncEntry(SERVICE_NAME, account, {
     linux: { store: "secret-service" },
   });
