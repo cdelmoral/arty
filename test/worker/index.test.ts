@@ -13,9 +13,17 @@ class MemoryR2 {
       : { arrayBuffer: async () => Uint8Array.from(value).buffer };
   }
 
+  async list({ prefix }: { prefix: string }) {
+    return {
+      objects: [...this.objects.keys()]
+        .filter((key) => key.startsWith(prefix))
+        .map((key) => ({ key })),
+    };
+  }
+
   async put(
     key: string,
-    value: ArrayBuffer | ArrayBufferView | string,
+    value: ArrayBuffer | ArrayBufferView | ReadableStream | string,
     options?: { onlyIf?: { etagDoesNotMatch?: string } },
   ) {
     if (options?.onlyIf?.etagDoesNotMatch === "*" && this.objects.has(key)) {
@@ -24,9 +32,11 @@ class MemoryR2 {
     const bytes =
       typeof value === "string"
         ? new TextEncoder().encode(value)
-        : value instanceof ArrayBuffer
-          ? new Uint8Array(value)
-          : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        : value instanceof ReadableStream
+          ? new Uint8Array(await new Response(value).arrayBuffer())
+          : value instanceof ArrayBuffer
+            ? new Uint8Array(value)
+            : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     this.objects.set(key, bytes.slice());
     return { etag: "test-etag" };
   }
@@ -40,6 +50,77 @@ class MemoryR2 {
 }
 
 describe("Worker HTTP interface", () => {
+  test("streams staged files and makes a repeated commit return the original result", async () => {
+    const bucket = new MemoryR2();
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: bucket,
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => 0,
+    };
+    const root =
+      "https://arty.test/_arty/artifacts/________________________________";
+    const headers = {
+      authorization: "Bearer local-secret",
+      "x-arty-protocol-version": "1",
+    };
+    const staged = await worker.fetch(
+      new Request(`${root}/files/index.html`, {
+        body: "artifact",
+        headers: {
+          ...headers,
+          "content-type": "text/html; charset=utf-8",
+          "x-arty-file-size": "8",
+        },
+        method: "PUT",
+      }),
+      environment,
+    );
+    expect(staged.status).toBe(204);
+    const commitRequest = () =>
+      new Request(`${root}/commit`, {
+        body: JSON.stringify({
+          files: [
+            {
+              contentType: "text/html; charset=utf-8",
+              path: "index.html",
+              size: 8,
+            },
+          ],
+        }),
+        headers: { ...headers, "x-arty-lifetime-ms": "60000" },
+        method: "POST",
+      });
+
+    const committed = await worker.fetch(commitRequest(), environment);
+    const repeated = await worker.fetch(commitRequest(), environment);
+
+    expect(committed.status).toBe(201);
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toEqual(await committed.json());
+  });
+
+  test("rejects incompatible management protocol versions before staging", async () => {
+    const bucket = new MemoryR2();
+    const response = await worker.fetch(
+      new Request(
+        "https://arty.test/_arty/artifacts/________________________________/files/index.html",
+        {
+          body: "artifact",
+          headers: {
+            authorization: "Bearer local-secret",
+            "x-arty-file-size": "8",
+            "x-arty-protocol-version": "2",
+          },
+          method: "PUT",
+        },
+      ),
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+
+    expect(response.status).toBe(426);
+    expect(bucket.objects.size).toBe(0);
+  });
+
   test("commits and serves only files declared by a directory Artifact", async () => {
     const bucket = new MemoryR2();
     const environment: WorkerEnvironment = {

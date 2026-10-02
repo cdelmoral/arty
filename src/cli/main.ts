@@ -3,6 +3,7 @@
 import { runCli } from "./app";
 
 const exitCode = await runCli(Bun.argv.slice(2), {
+  stderrIsInteractive: process.stderr.isTTY,
   writeStderr: (text) => process.stderr.write(text),
   writeStdout: (text) => process.stdout.write(text),
 });

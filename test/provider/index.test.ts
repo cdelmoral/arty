@@ -5,7 +5,11 @@ import { join } from "node:path";
 
 import { setCloudflareConfig } from "../../src/config";
 import type { CredentialStore } from "../../src/credentials";
-import { createConfiguredCloudflareProvider } from "../../src/provider";
+import {
+  createConfiguredCloudflareProvider,
+  createLocalWorkerProvider,
+  ProviderError,
+} from "../../src/provider";
 
 const temporaryDirectories: Array<string> = [];
 
@@ -41,7 +45,7 @@ describe("configured Cloudflare Provider", () => {
       environment: { XDG_CONFIG_HOME: configHome },
       fetch: async (input: string | URL | Request, init?: RequestInit) => {
         const request = new Request(input, init);
-        expect(request.url).toBe(
+        expect(request.url).toStartWith(
           "https://arty.publisher.workers.dev/_arty/artifacts/________________________________",
         );
         expect(request.headers.get("authorization")).toBe(
@@ -50,10 +54,13 @@ describe("configured Cloudflare Provider", () => {
         expect(request.headers.get("authorization")).not.toContain(
           "cloudflare-api-token",
         );
-        return Response.json(
-          { expiresAt: "2026-10-09T12:00:00.000Z" },
-          { status: 201 },
-        );
+        expect(request.headers.get("x-arty-protocol-version")).toBe("1");
+        return request.url.endsWith("/commit")
+          ? Response.json(
+              { expiresAt: "2026-10-09T12:00:00.000Z" },
+              { status: 201 },
+            )
+          : new Response(null, { status: 204 });
       },
       platform: "linux",
     };
@@ -84,5 +91,135 @@ describe("configured Cloudflare Provider", () => {
         "https://arty.publisher.workers.dev/________________________________/",
       expiresAt: "2026-10-09T12:00:00.000Z",
     });
+  });
+});
+
+describe("publication resilience", () => {
+  const publication = {
+    artifactId: "________________________________",
+    files: [
+      {
+        content: new TextEncoder().encode("artifact"),
+        contentType: "text/html; charset=utf-8",
+        path: "index.html",
+      },
+    ],
+    lifetimeMilliseconds: 60_000,
+  };
+
+  test("honors Retry-After and reuses the Artifact ID after a transient response", async () => {
+    const urls: Array<string> = [];
+    const delays: Array<number> = [];
+    let stagingAttempts = 0;
+    const provider = createLocalWorkerProvider(
+      "https://arty.example",
+      "secret",
+      async (input) => {
+        const url = String(input);
+        urls.push(url);
+        if (url.endsWith("/commit")) {
+          return Response.json({ expiresAt: "2026-10-02T12:01:00.000Z" });
+        }
+        stagingAttempts += 1;
+        return stagingAttempts === 1
+          ? new Response(null, { headers: { "retry-after": "2" }, status: 429 })
+          : new Response(null, { status: 204 });
+      },
+      { random: () => 0, sleep: async (delay) => void delays.push(delay) },
+    );
+
+    await provider.publish(publication);
+
+    expect(delays).toEqual([2_000]);
+    expect(urls).toEqual([
+      "https://arty.example/_arty/artifacts/________________________________/files/index.html",
+      "https://arty.example/_arty/artifacts/________________________________/files/index.html",
+      "https://arty.example/_arty/artifacts/________________________________/commit",
+    ]);
+  });
+
+  test("does not retry authentication failures and attempts staged cleanup", async () => {
+    const methods: Array<string | undefined> = [];
+    const provider = createLocalWorkerProvider(
+      "https://arty.example",
+      "secret",
+      async (_input, init) => {
+        methods.push(init?.method);
+        return new Response(null, { status: 401 });
+      },
+      { sleep: async () => {} },
+    );
+
+    await expect(provider.publish(publication)).rejects.toBeInstanceOf(
+      ProviderError,
+    );
+    expect(methods).toEqual(["PUT", "DELETE"]);
+  });
+
+  test("directs the Publisher to reinitialize on protocol mismatch", async () => {
+    const provider = createLocalWorkerProvider(
+      "https://arty.example",
+      "secret",
+      async (_input, init) =>
+        new Response(null, { status: init?.method === "DELETE" ? 204 : 426 }),
+    );
+
+    await expect(provider.publish(publication)).rejects.toThrow(
+      "Run `arty init cloudflare`",
+    );
+  });
+
+  test("reconciles a commit whose successful response was lost", async () => {
+    let commits = 0;
+    const provider = createLocalWorkerProvider(
+      "https://arty.example",
+      "secret",
+      async (input) => {
+        if (!String(input).endsWith("/commit")) {
+          return new Response(null, { status: 204 });
+        }
+        commits += 1;
+        if (commits === 1) throw new TypeError("connection closed");
+        return Response.json(
+          { expiresAt: "2026-10-02T12:01:00.000Z" },
+          { status: 200 },
+        );
+      },
+      { random: () => 0, sleep: async () => {} },
+    );
+
+    const result = await provider.publish(publication);
+
+    expect(commits).toBe(2);
+    expect(result.accessUrl).toBe(
+      "https://arty.example/________________________________/",
+    );
+  });
+
+  test("fails and cleans up when a Source changes after streaming", async () => {
+    const methods: Array<string | undefined> = [];
+    const provider = createLocalWorkerProvider(
+      "https://arty.example",
+      "secret",
+      async (_input, init) => {
+        methods.push(init?.method);
+        return new Response(null, { status: 204 });
+      },
+    );
+
+    await expect(
+      provider.publish({
+        ...publication,
+        files: [
+          {
+            ...publication.files[0]!,
+            verify: async () => {
+              throw new Error("Source changed during publication");
+            },
+          },
+        ],
+      }),
+    ).rejects.toThrow("Source changed during publication");
+    expect(methods).toEqual(["PUT", "DELETE"]);
   });
 });
