@@ -4,21 +4,15 @@ import worker, { type WorkerEnvironment } from "../../worker";
 
 class MemoryR2 {
   readonly objects = new Map<string, Uint8Array>();
+  readonly operations: Array<string> = [];
   failFileDeletion = false;
+  failNextFileDeletion = false;
 
   async get(key: string) {
     const value = this.objects.get(key);
     return value === undefined
       ? null
       : { arrayBuffer: async () => Uint8Array.from(value).buffer };
-  }
-
-  async list({ prefix }: { prefix: string }) {
-    return {
-      objects: [...this.objects.keys()]
-        .filter((key) => key.startsWith(prefix))
-        .map((key) => ({ key })),
-    };
   }
 
   async put(
@@ -41,13 +35,57 @@ class MemoryR2 {
     return { etag: "test-etag" };
   }
 
-  async delete(key: string) {
-    if (this.failFileDeletion && key.startsWith("staging/")) {
+  async delete(keyOrKeys: string | ReadonlyArray<string>) {
+    const keys = typeof keyOrKeys === "string" ? [keyOrKeys] : keyOrKeys;
+    this.operations.push(`delete:${keys.join(",")}`);
+    if (
+      (this.failFileDeletion || this.failNextFileDeletion) &&
+      keys.some((key) => key.startsWith("staging/"))
+    ) {
+      this.failNextFileDeletion = false;
       throw new Error("physical cleanup failed");
     }
-    this.objects.delete(key);
+    for (const key of keys) this.objects.delete(key);
+  }
+
+  async list(options?: { cursor?: string; limit?: number; prefix?: string }) {
+    this.operations.push(`list:${options?.cursor ?? ""}`);
+    const keys = [...this.objects.keys()]
+      .filter((key) => key.startsWith(options?.prefix ?? ""))
+      .sort();
+    const start = Number(options?.cursor ?? 0);
+    const end = Math.min(start + (options?.limit ?? 1_000), keys.length);
+    return {
+      cursor: end < keys.length ? String(end) : undefined,
+      objects: keys.slice(start, end).map((key) => ({ key })),
+      truncated: end < keys.length,
+    };
   }
 }
+
+const storeArtifact = async (
+  bucket: MemoryR2,
+  artifactId: string,
+  expiresAt: string,
+  fileCount = 1,
+) => {
+  const files = Array.from({ length: fileCount }, (_, index) => ({
+    contentType: "text/plain",
+    path: `file-${index}.txt`,
+  }));
+  await bucket.put(
+    `manifests/${artifactId}.json`,
+    JSON.stringify({
+      createdAt: "2026-10-01T00:00:00.000Z",
+      expiresAt,
+      files,
+      version: 1,
+    }),
+  );
+  for (const file of files) {
+    await bucket.put(`staging/${artifactId}/${file.path}`, "content");
+  }
+};
 
 describe("Worker HTTP interface", () => {
   test("streams staged files and makes a repeated commit return the original result", async () => {
@@ -609,5 +647,99 @@ describe("Worker HTTP interface", () => {
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.has("content-security-policy")).toBe(false);
     expect(response.headers.has("access-control-allow-origin")).toBe(false);
+  });
+});
+
+describe("Worker scheduled interface", () => {
+  test("removes expired manifests before their files and leaves live Artifacts unchanged", async () => {
+    const bucket = new MemoryR2();
+    const expiredId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const liveId = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    await storeArtifact(bucket, expiredId, "2026-10-02T11:59:59.999Z", 2);
+    await storeArtifact(bucket, liveId, "2026-10-02T12:00:00.001Z");
+
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+
+    expect(bucket.objects.has(`manifests/${expiredId}.json`)).toBe(false);
+    expect(bucket.objects.has(`staging/${expiredId}/file-0.txt`)).toBe(false);
+    expect(bucket.objects.has(`staging/${expiredId}/file-1.txt`)).toBe(false);
+    expect(bucket.objects.has(`manifests/${liveId}.json`)).toBe(true);
+    expect(bucket.objects.has(`staging/${liveId}/file-0.txt`)).toBe(true);
+    expect(
+      bucket.operations.indexOf(`delete:manifests/${expiredId}.json`),
+    ).toBeLessThan(
+      bucket.operations.indexOf(
+        `delete:staging/${expiredId}/file-0.txt,staging/${expiredId}/file-1.txt`,
+      ),
+    );
+  });
+
+  test("paginates manifest scans but bounds one invocation", async () => {
+    const bucket = new MemoryR2();
+    for (let index = 0; index < 20; index += 1) {
+      await storeArtifact(
+        bucket,
+        index.toString(36).padStart(32, "0"),
+        "2026-10-03T00:00:00.000Z",
+      );
+    }
+
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+
+    expect(
+      bucket.operations.filter((operation) => operation.startsWith("list:")),
+    ).toEqual(["list:", "list:4", "list:8", "list:12"]);
+  });
+
+  test("caps expired Artifact cleanup and batches file deletion", async () => {
+    const bucket = new MemoryR2();
+    for (let index = 0; index < 6; index += 1) {
+      await storeArtifact(
+        bucket,
+        index.toString(36).padStart(32, "0"),
+        "2026-10-01T00:00:00.000Z",
+        1_001,
+      );
+    }
+
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+
+    expect(
+      [...bucket.objects.keys()].filter((key) => key.startsWith("manifests/")),
+    ).toHaveLength(1);
+    const fileDeletions = bucket.operations
+      .filter((operation) => operation.startsWith("delete:staging/"))
+      .map((operation) => operation.slice("delete:".length).split(",").length);
+    expect(fileDeletions).toEqual([
+      1_000, 1, 1_000, 1, 1_000, 1, 1_000, 1, 1_000, 1,
+    ]);
+  });
+
+  test("keeps cleanup safe after a file deletion failure and on repeated runs", async () => {
+    const bucket = new MemoryR2();
+    const artifactId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    await storeArtifact(bucket, artifactId, "2026-10-01T00:00:00.000Z");
+    bucket.failNextFileDeletion = true;
+
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      { ARTIFACTS: bucket, MANAGEMENT_SECRET: "local-secret" },
+    );
+
+    expect(bucket.objects.has(`manifests/${artifactId}.json`)).toBe(false);
+    expect(bucket.objects.has(`staging/${artifactId}/file-0.txt`)).toBe(true);
   });
 });
