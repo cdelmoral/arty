@@ -1,0 +1,27 @@
+{
+  "name": "arty",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "arty": "./src/cli/main.ts"
+  },
+  "scripts": {
+    "build": "bun build --compile --minify --outfile dist/arty src/cli/main.ts",
+    "check": "bun run format:check && bun run typecheck && bun test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "15.0.0",
+    "effect": "4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "bun@1.3.3"
+}
