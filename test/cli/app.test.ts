@@ -13,6 +13,8 @@ import { join } from "node:path";
 
 import { runCli, type CliOutput, type CliRuntime } from "../../src/cli/app";
 import type {
+  CloudflareDestroyRequest,
+  CloudflareDestroyer,
   CloudflareProvisionRequest,
   CloudflareProvisioner,
 } from "../../src/cloudflare";
@@ -45,6 +47,11 @@ const unusedProvisioner: CloudflareProvisioner = {
     throw new Error("Cloudflare should not be called");
   },
 };
+const unusedDestroyer: CloudflareDestroyer = {
+  destroy: async () => {
+    throw new Error("Cloudflare should not be called");
+  },
+};
 
 afterEach(async () => {
   await Promise.all(
@@ -72,6 +79,7 @@ const invoke = async (
 
   const exitCode = await runCli(argv, output, {
     credentialStore: unusedCredentialStore,
+    destroyer: unusedDestroyer,
     environment,
     initialization: {
       confirm: async () => false,
@@ -491,7 +499,7 @@ describe("CLI application", () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  --verbose                  show detailed diagnostics on stderr\n  --lifetime <duration>      Lifetime for this Artifact\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                          local HTML Source to publish\n\nOptions:\n  -V, --version                 output the version number\n  --verbose                     show detailed diagnostics on stderr\n  --lifetime <duration>         Lifetime for this Artifact\n  -h, --help                    display help for command\n\nCommands:\n  publish <path>                Publish one local Source.\n  init [options] <provider>     Initialize a Provider account.\n  delete <url-or-id>            Delete an Artifact before expiry.\n  destroy [options] <provider>  Remove Arty from a Provider account.\n  config                        Manage Arty settings.\n`,
     });
   });
 
@@ -550,6 +558,116 @@ describe("CLI application", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe("error: Invalid Artifact ID or Access URL.\n");
     expect(providerCalls).toBe(0);
+  });
+
+  test("destroys Cloudflare after informed confirmation", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-destroy-test-"));
+    temporaryDirectories.push(configHome);
+    await mkdir(join(configHome, "arty"), { recursive: true });
+    await Bun.write(
+      join(configHome, "arty", "config.json"),
+      '{"cloudflare":{"accountId":"account-123","bucketName":"arty-content","protocolVersion":1,"workerName":"arty","workerUrl":"https://arty.publisher.workers.dev"},"defaultLifetime":"90m"}',
+    );
+    const credentials = new Map([
+      ["cloudflare:account-123:api-token", "api-token"],
+      ["cloudflare:account-123:management-secret", "management-secret"],
+    ]);
+    const confirmations: Array<string> = [];
+    const requests: Array<CloudflareDestroyRequest> = [];
+
+    const result = await invoke(
+      ["destroy", "cloudflare"],
+      { XDG_CONFIG_HOME: configHome },
+      {
+        credentialStore: {
+          delete: async (account) => void credentials.delete(account),
+          get: async (account) => credentials.get(account),
+          set: async () => {},
+        },
+        destroyer: {
+          destroy: async (request) => void requests.push(request),
+        },
+        initialization: {
+          confirm: async (message) => {
+            confirmations.push(message);
+            return true;
+          },
+          promptSecret: async () => "",
+          promptText: async () => "",
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("delete every Artifact");
+    expect(confirmations).toEqual(["Destroy Arty Cloudflare resources? "]);
+    expect(requests).toEqual([
+      {
+        accountId: "account-123",
+        bucketName: "arty-content",
+        token: "api-token",
+        workerName: "arty",
+      },
+    ]);
+    expect(credentials.size).toBe(0);
+    expect(
+      JSON.parse(
+        await readFile(join(configHome, "arty", "config.json"), "utf8"),
+      ),
+    ).toEqual({ defaultLifetime: "90m" });
+  });
+
+  test("retains local recovery state when Cloudflare destruction fails", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-destroy-test-"));
+    temporaryDirectories.push(configHome);
+    await mkdir(join(configHome, "arty"), { recursive: true });
+    const original =
+      '{"cloudflare":{"accountId":"account-123","bucketName":"arty-content","protocolVersion":1,"workerName":"arty","workerUrl":"https://arty.publisher.workers.dev"}}';
+    await Bun.write(join(configHome, "arty", "config.json"), original);
+    const deleted: Array<string> = [];
+
+    const result = await invoke(
+      ["destroy", "cloudflare", "--force"],
+      { XDG_CONFIG_HOME: configHome },
+      {
+        credentialStore: {
+          delete: async (account) => void deleted.push(account),
+          get: async () => "api-token",
+          set: async () => {},
+        },
+        destroyer: {
+          destroy: async () => {
+            throw new Error("remote failure");
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(deleted).toEqual([]);
+    expect(
+      await readFile(join(configHome, "arty", "config.json"), "utf8"),
+    ).toBe(original);
+  });
+
+  test("refuses non-interactive destruction without --force", async () => {
+    const result = await invoke(
+      ["destroy", "cloudflare"],
+      {},
+      {
+        initialization: {
+          confirm: async () => {
+            throw new Error("input unavailable");
+          },
+          promptSecret: async () => "",
+          promptText: async () => "",
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--force");
   });
 
   test("prints only the version to stdout", async () => {

@@ -2,10 +2,14 @@ import { Command, CommanderError } from "commander";
 import { Effect } from "effect";
 
 import {
+  createCloudflareDestroyer,
   createCloudflareProvisioner,
+  DestructionError,
+  destroyCloudflare,
   InitializationError,
   initializeCloudflare,
   type CloudflareProvisioner,
+  type CloudflareDestroyer,
   type InitializationIO,
 } from "../cloudflare";
 import {
@@ -33,6 +37,7 @@ export interface CliOutput {
 
 export interface CliRuntime extends ConfigEnvironment {
   readonly credentialStore: CredentialStore;
+  readonly destroyer: CloudflareDestroyer;
   readonly initialization: InitializationIO;
   readonly provider: Provider;
   readonly provisioner: CloudflareProvisioner;
@@ -127,6 +132,18 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
       output.writeStderr(`Deleted Artifact ${artifactId}.\n`);
     });
 
+  program
+    .command("destroy")
+    .description("Remove Arty from a Provider account.")
+    .argument("<provider>")
+    .option("--force", "skip interactive confirmation")
+    .action(async (provider: string, options: { readonly force?: boolean }) => {
+      if (provider !== "cloudflare") {
+        throw new DestructionError(`Unknown Provider: ${provider}`);
+      }
+      await destroyCloudflare(options.force ?? false, output, runtime);
+    });
+
   const config = program.command("config").description("Manage Arty settings.");
   config
     .command("get")
@@ -184,6 +201,7 @@ export const runCli = (
         runtime ??
         ({
           ...productionRuntimeBase,
+          destroyer: createCloudflareDestroyer(),
           provider: createConfiguredCloudflareProvider(productionRuntimeBase),
         } satisfies CliRuntime);
       try {
@@ -199,6 +217,7 @@ export const runCli = (
         if (
           error instanceof ConfigError ||
           error instanceof CredentialError ||
+          error instanceof DestructionError ||
           error instanceof InitializationError ||
           error instanceof DeleteError ||
           error instanceof PublishError
