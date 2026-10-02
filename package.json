@@ -12,8 +12,11 @@
     "check": "bun run format:check && bun run typecheck && bun test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "formula": "bun run scripts/homebrew-formula.ts",
+    "smoke:cloudflare": "bash scripts/cloudflare-release-smoke.sh",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:archive": "bun run scripts/verify-release-archive.ts"
   },
   "dependencies": {
     "@napi-rs/keyring": "2.1.0",
