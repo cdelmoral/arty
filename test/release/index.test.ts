@@ -27,11 +27,12 @@ describe("release configuration", () => {
       ".github/workflows/release.yml",
     ]) {
       const workflow = await read(path);
-      expect(workflow).toContain("security create-keychain");
-      expect(workflow).toContain("security unlock-keychain");
+      expect(workflow).toContain('security create-keychain -p ""');
+      expect(workflow).toContain('security unlock-keychain -p ""');
       expect(workflow).toContain("security list-keychains -d user -s");
       expect(workflow).toContain("security default-keychain -d user -s");
       expect(workflow).toContain("_credential-smoke-test");
+      expect(workflow).not.toContain("openssl rand");
     }
   });
 
