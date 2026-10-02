@@ -5,12 +5,18 @@ import { join } from "node:path";
 
 import { runCli, type CliOutput, type CliRuntime } from "../../src/cli/app";
 import type { CredentialStore } from "../../src/credentials";
+import type { Provider } from "../../src/provider";
 
 const temporaryDirectories: Array<string> = [];
 const unusedCredentialStore: CredentialStore = {
   delete: async () => {},
   get: async () => undefined,
   set: async () => {},
+};
+const unusedProvider: Provider = {
+  publish: async () => {
+    throw new Error("Provider should not be called");
+  },
 };
 
 afterEach(async () => {
@@ -41,6 +47,8 @@ const invoke = async (
     credentialStore: unusedCredentialStore,
     environment,
     platform: "linux",
+    provider: unusedProvider,
+    randomBytes: (length) => new Uint8Array(length),
     ...runtime,
   });
 
@@ -48,11 +56,92 @@ const invoke = async (
 };
 
 describe("CLI application", () => {
+  test.each([
+    ["explicit", ["publish"]],
+    ["implicit", []],
+  ])("publishes one HTML Source with the %s command", async (_name, prefix) => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-source-test-"));
+    temporaryDirectories.push(sourceDirectory);
+    const sourcePath = join(sourceDirectory, "prototype.html");
+    await Bun.write(sourcePath, "<h1>Hello from Arty</h1>");
+    const requests: Array<{
+      artifactId: string;
+      content: Uint8Array;
+    }> = [];
+    const provider: Provider = {
+      publish: async (request) => {
+        requests.push(request);
+        return `https://arty.example/${request.artifactId}/`;
+      },
+    };
+
+    const result = await invoke(
+      [...prefix, sourcePath],
+      {},
+      {
+        provider,
+        randomBytes: () => new Uint8Array(24).fill(255),
+      },
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stderr: "Published Artifact.\n",
+      stdout: "https://arty.example/________________________________/\n",
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.artifactId).toBe("________________________________");
+    expect(new TextDecoder().decode(requests[0]?.content)).toBe(
+      "<h1>Hello from Arty</h1>",
+    );
+  });
+
+  test.each([
+    ["no Source", []],
+    ["missing Source", ["publish", "/missing/prototype.html"]],
+    ["non-HTML Source", ["publish", import.meta.filename]],
+    ["standard input", ["publish", "-"]],
+    ["remote URL", ["publish", "https://example.com/prototype.html"]],
+    ["multiple Sources", ["publish", "one.html", "two.html"]],
+  ])("rejects %s before calling the Provider", async (_name, argv) => {
+    let providerCalls = 0;
+    const provider: Provider = {
+      publish: async () => {
+        providerCalls += 1;
+        return "https://arty.example/unexpected/";
+      },
+    };
+
+    const result = await invoke(argv, {}, { provider });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(providerCalls).toBe(0);
+  });
+
+  test("rejects a directory before calling the Provider", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site.html-"));
+    temporaryDirectories.push(sourceDirectory);
+    let providerCalls = 0;
+    const provider: Provider = {
+      publish: async () => {
+        providerCalls += 1;
+        return "https://arty.example/unexpected/";
+      },
+    };
+
+    const result = await invoke(["publish", sourceDirectory], {}, { provider });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(providerCalls).toBe(0);
+  });
+
   test("prints stable help to stdout", async () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command]\n\nPublish temporary static Artifacts from local Sources.\n\nOptions:\n  -V, --version   output the version number\n  -h, --help      display help for command\n\nCommands:\n  config          Manage Arty settings.\n  help [command]  display help for command\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path            local HTML Source to publish\n\nOptions:\n  -V, --version   output the version number\n  -h, --help      display help for command\n\nCommands:\n  publish <path>  Publish one local Source.\n  config          Manage Arty settings.\n`,
     });
   });
 

@@ -13,6 +13,8 @@ import {
   smokeTestCredentialStore,
   type CredentialStore,
 } from "../credentials";
+import { createLocalWorkerProvider, type Provider } from "../provider";
+import { publish, PublishError } from "../publish";
 
 export interface CliOutput {
   readonly writeStderr: (text: string) => void;
@@ -21,6 +23,8 @@ export interface CliOutput {
 
 export interface CliRuntime extends ConfigEnvironment {
   readonly credentialStore: CredentialStore;
+  readonly provider: Provider;
+  readonly randomBytes: (length: number) => Uint8Array;
 }
 
 const createProgram = (output: CliOutput, runtime: CliRuntime) => {
@@ -33,6 +37,27 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
       writeOut: output.writeStdout,
     })
     .exitOverride();
+
+  const publishSource = async (path: string) => {
+    const accessUrl = await Effect.runPromise(publish(path, runtime));
+    output.writeStdout(`${accessUrl}\n`);
+    output.writeStderr("Published Artifact.\n");
+  };
+
+  program
+    .argument("[path]", "local HTML Source to publish")
+    .action(async (path?: string) => {
+      if (path === undefined) {
+        throw new PublishError("A Source path is required.");
+      }
+      await publishSource(path);
+    });
+
+  program
+    .command("publish")
+    .description("Publish one local Source.")
+    .argument("<path>")
+    .action(publishSource);
 
   const config = program.command("config").description("Manage Arty settings.");
   config
@@ -78,6 +103,11 @@ export const runCli = (
     credentialStore: nativeCredentialStore,
     environment: process.env,
     platform: process.platform,
+    provider: createLocalWorkerProvider(
+      process.env.ARTY_WORKER_URL,
+      process.env.ARTY_MANAGEMENT_SECRET,
+    ),
+    randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
   },
 ): Promise<number> =>
   Effect.runPromise(
@@ -92,7 +122,11 @@ export const runCli = (
           return error.exitCode;
         }
 
-        if (error instanceof ConfigError || error instanceof CredentialError) {
+        if (
+          error instanceof ConfigError ||
+          error instanceof CredentialError ||
+          error instanceof PublishError
+        ) {
           output.writeStderr(`error: ${error.message}\n`);
           return 1;
         }
