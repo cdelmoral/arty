@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+
 import type { CloudflareConfig, ConfigEnvironment } from "../config";
 import {
   clearCloudflareConfig,
@@ -7,6 +9,7 @@ import {
 import type { CredentialStore } from "../credentials";
 import { resolveCredential } from "../credentials";
 import { MANAGEMENT_PROTOCOL_VERSION } from "../shared/protocol";
+import { workerSource } from "./worker-source";
 
 export const cloudflareApiTokenAccount = (accountId: string): string =>
   `cloudflare:${accountId}:api-token`;
@@ -75,7 +78,7 @@ export interface DestroyEnvironment extends ConfigEnvironment {
   readonly initialization: InitializationIO;
 }
 
-export const destroyCloudflare = async (
+const destroyCloudflareWorkflow = async (
   force: boolean,
   output: { readonly writeStderr: (text: string) => void },
   runtime: DestroyEnvironment,
@@ -148,7 +151,7 @@ const required = (value: string, label: string): string => {
   return trimmed;
 };
 
-export const initializeCloudflare = async (
+const initializeCloudflareWorkflow = async (
   options: InitializeOptions,
   output: { readonly writeStderr: (text: string) => void },
   runtime: InitializeEnvironment,
@@ -282,62 +285,37 @@ export const initializeCloudflare = async (
   );
 };
 
+export const destroyCloudflare = (
+  force: boolean,
+  output: { readonly writeStderr: (text: string) => void },
+  runtime: DestroyEnvironment,
+): Effect.Effect<void, DestructionError> =>
+  Effect.tryPromise({
+    try: () => destroyCloudflareWorkflow(force, output, runtime),
+    catch: (error) =>
+      error instanceof DestructionError
+        ? error
+        : new DestructionError("Cloudflare destruction failed."),
+  });
+
+export const initializeCloudflare = (
+  options: InitializeOptions,
+  output: { readonly writeStderr: (text: string) => void },
+  runtime: InitializeEnvironment,
+): Effect.Effect<void, InitializationError> =>
+  Effect.tryPromise({
+    try: () => initializeCloudflareWorkflow(options, output, runtime),
+    catch: (error) =>
+      error instanceof InitializationError
+        ? error
+        : new InitializationError("Cloudflare initialization failed."),
+  });
+
 interface CloudflareEnvelope<T> {
   readonly errors?: ReadonlyArray<{ readonly message?: string }>;
   readonly result?: T;
   readonly success: boolean;
 }
-
-const workerSource = `const ARTY_OWNER = "arty";
-const ARTY_PROTOCOL_VERSION = ${MANAGEMENT_PROTOCOL_VERSION};
-const cleanup = async (scheduledTime, env) => {
-  let cursor;
-  const manifestKeys = [];
-  for (let page = 0; page < 4; page += 1) {
-    const listed = await env.ARTIFACTS.list({ prefix: "manifests/", limit: 4, ...(cursor === undefined ? {} : { cursor }) });
-    manifestKeys.push(...listed.objects.map(object => object.key));
-    if (!listed.truncated || !listed.cursor) break;
-    cursor = listed.cursor;
-  }
-  let expired = 0;
-  for (const manifestKey of manifestKeys) {
-    if (expired >= 5) return;
-    try {
-      const stored = await env.ARTIFACTS.get(manifestKey);
-      if (!stored) continue;
-      const manifest = await stored.json();
-      if (scheduledTime < Date.parse(manifest.expiresAt)) continue;
-      const id = manifestKey.slice("manifests/".length, -".json".length);
-      await env.ARTIFACTS.delete(manifestKey);
-      expired += 1;
-      const keys = manifest.files.map(file => "staging/" + id + "/" + file.path);
-      for (let index = 0; index < keys.length; index += 1000) await env.ARTIFACTS.delete(keys.slice(index, index + 1000));
-    } catch {}
-  }
-};
-export default { async fetch(request, env) {
-  const url = new URL(request.url);
-  const management = /^\\/_arty\\/artifacts\\/([A-Za-z0-9_-]{32})$/.exec(url.pathname);
-  if (management) {
-    if (request.headers.has("origin")) return new Response(null, { status: 403 });
-    if (request.method !== "PUT" || request.headers.get("authorization") !== "Bearer " + env.MANAGEMENT_SECRET) return new Response(null, { status: 401 });
-    const id = management[1];
-    const content = await request.arrayBuffer();
-    const staged = await env.ARTIFACTS.put("staging/" + id + "/index.html", content, { onlyIf: { etagDoesNotMatch: "*" } });
-    if (!staged) return new Response(null, { status: 409 });
-    const manifest = JSON.stringify({ contentType: "text/html; charset=utf-8", path: "index.html", version: 1 });
-    const committed = await env.ARTIFACTS.put("manifests/" + id + ".json", manifest, { onlyIf: { etagDoesNotMatch: "*" } });
-    return new Response(null, { status: committed ? 201 : 409 });
-  }
-  if (request.method !== "GET") return new Response(null, { status: 405 });
-  const viewer = /^\\/([A-Za-z0-9_-]{32})\\/$/.exec(url.pathname);
-  if (!viewer) return new Response("Not found", { status: 404 });
-  const manifestObject = await env.ARTIFACTS.get("manifests/" + viewer[1] + ".json");
-  if (!manifestObject) return new Response("Not found", { status: 404 });
-  const manifest = await manifestObject.json();
-  const source = await env.ARTIFACTS.get("staging/" + viewer[1] + "/" + manifest.path);
-  return source ? new Response(source.body, { headers: { "content-type": manifest.contentType } }) : new Response("Not found", { status: 404 });
-}, async scheduled(controller, env) { await cleanup(controller.scheduledTime, env); } };`;
 
 type CloudflareFetch = (
   input: string | URL | Request,
@@ -554,7 +532,13 @@ export const createCloudflareProvisioner = (
             method: "POST",
           });
         } catch (error) {
-          if (!(await exists(bucketPath, provisioning.token))) throw error;
+          if (await exists(bucketPath, provisioning.token)) {
+            throw new InitializationError(
+              `Cloudflare created R2 bucket "${provisioning.bucketName}" after an ambiguous response, but Arty could not prove ownership. Refusing to mark it as owned.`,
+              { cause: error },
+            );
+          }
+          throw error;
         }
       }
       await request(lifecyclePath, provisioning.token, {

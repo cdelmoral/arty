@@ -94,8 +94,8 @@ describe("configured Cloudflare Provider", () => {
   });
 });
 
-describe("publication resilience", () => {
-  const publication = {
+describe("Publish resilience", () => {
+  const publishRequest = {
     artifactId: "________________________________",
     files: [
       {
@@ -128,7 +128,7 @@ describe("publication resilience", () => {
       { random: () => 0, sleep: async (delay) => void delays.push(delay) },
     );
 
-    await provider.publish(publication);
+    await provider.publish(publishRequest);
 
     expect(delays).toEqual([2_000]);
     expect(urls).toEqual([
@@ -150,7 +150,7 @@ describe("publication resilience", () => {
       { sleep: async () => {} },
     );
 
-    await expect(provider.publish(publication)).rejects.toBeInstanceOf(
+    await expect(provider.publish(publishRequest)).rejects.toBeInstanceOf(
       ProviderError,
     );
     expect(methods).toEqual(["PUT", "DELETE"]);
@@ -164,7 +164,7 @@ describe("publication resilience", () => {
         new Response(null, { status: init?.method === "DELETE" ? 204 : 426 }),
     );
 
-    await expect(provider.publish(publication)).rejects.toThrow(
+    await expect(provider.publish(publishRequest)).rejects.toThrow(
       "Run `arty init cloudflare`",
     );
   });
@@ -188,7 +188,7 @@ describe("publication resilience", () => {
       { random: () => 0, sleep: async () => {} },
     );
 
-    const result = await provider.publish(publication);
+    const result = await provider.publish(publishRequest);
 
     expect(commits).toBe(2);
     expect(result.accessUrl).toBe(
@@ -209,17 +209,17 @@ describe("publication resilience", () => {
 
     await expect(
       provider.publish({
-        ...publication,
+        ...publishRequest,
         files: [
           {
-            ...publication.files[0]!,
+            ...publishRequest.files[0]!,
             verify: async () => {
-              throw new Error("Source changed during publication");
+              throw new Error("Source changed while publishing");
             },
           },
         ],
       }),
-    ).rejects.toThrow("Source changed during publication");
+    ).rejects.toThrow("Source changed while publishing");
     expect(methods).toEqual(["PUT", "DELETE"]);
   });
 });

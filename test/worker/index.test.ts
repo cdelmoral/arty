@@ -697,6 +697,35 @@ describe("Worker scheduled interface", () => {
     ).toEqual(["list:", "list:4", "list:8", "list:12"]);
   });
 
+  test("resumes the manifest scan across bounded invocations", async () => {
+    const bucket = new MemoryR2();
+    for (let index = 0; index < 20; index += 1) {
+      await storeArtifact(
+        bucket,
+        index.toString(36).padStart(32, "0"),
+        "2026-10-03T00:00:00.000Z",
+      );
+    }
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: bucket,
+      MANAGEMENT_SECRET: "local-secret",
+    };
+
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      environment,
+    );
+    bucket.operations.length = 0;
+    await worker.scheduled(
+      { scheduledTime: Date.parse("2026-10-02T12:00:00.000Z") },
+      environment,
+    );
+
+    expect(
+      bucket.operations.filter((operation) => operation.startsWith("list:")),
+    ).toEqual(["list:16"]);
+  });
+
   test("caps expired Artifact cleanup and batches file deletion", async () => {
     const bucket = new MemoryR2();
     for (let index = 0; index < 6; index += 1) {

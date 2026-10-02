@@ -109,14 +109,16 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
         if (provider !== "cloudflare") {
           throw new InitializationError(`Unknown Provider: ${provider}`);
         }
-        await initializeCloudflare(
-          {
-            bucketName: options.bucketName,
-            workerName: options.workerName,
-            yes: options.yes ?? false,
-          },
-          output,
-          runtime,
+        await Effect.runPromise(
+          initializeCloudflare(
+            {
+              bucketName: options.bucketName,
+              workerName: options.workerName,
+              yes: options.yes ?? false,
+            },
+            output,
+            runtime,
+          ),
         );
       },
     );
@@ -141,7 +143,9 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
       if (provider !== "cloudflare") {
         throw new DestructionError(`Unknown Provider: ${provider}`);
       }
-      await destroyCloudflare(options.force ?? false, output, runtime);
+      await Effect.runPromise(
+        destroyCloudflare(options.force ?? false, output, runtime),
+      );
     });
 
   const config = program.command("config").description("Manage Arty settings.");
