@@ -4,6 +4,7 @@ import { Effect } from "effect";
 import {
   ConfigError,
   getDefaultLifetime,
+  lifetimeInMilliseconds,
   setDefaultLifetime,
   type ConfigEnvironment,
 } from "../config";
@@ -38,26 +39,32 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
     })
     .exitOverride();
 
-  const publishSource = async (path: string) => {
-    const accessUrl = await Effect.runPromise(publish(path, runtime));
-    output.writeStdout(`${accessUrl}\n`);
-    output.writeStderr("Published Artifact.\n");
+  const publishSource = async (path: string, lifetime?: string) => {
+    const selectedLifetime = lifetime ?? (await getDefaultLifetime(runtime));
+    const result = await Effect.runPromise(
+      publish(path, lifetimeInMilliseconds(selectedLifetime), runtime),
+    );
+    output.writeStdout(`${result.accessUrl}\n`);
+    output.writeStderr(`Published Artifact. Expires at ${result.expiresAt}.\n`);
   };
 
   program
+    .option("--lifetime <duration>", "Lifetime for this Artifact")
     .argument("[path]", "local HTML Source to publish")
     .action(async (path?: string) => {
       if (path === undefined) {
         throw new PublishError("A Source path is required.");
       }
-      await publishSource(path);
+      await publishSource(path, program.opts<{ lifetime?: string }>().lifetime);
     });
 
   program
     .command("publish")
     .description("Publish one local Source.")
     .argument("<path>")
-    .action(publishSource);
+    .action(async (path: string) => {
+      await publishSource(path, program.opts<{ lifetime?: string }>().lifetime);
+    });
 
   const config = program.command("config").description("Manage Arty settings.");
   config

@@ -37,6 +37,7 @@ describe("Worker HTTP interface", () => {
     const environment: WorkerEnvironment = {
       ARTIFACTS: bucket,
       MANAGEMENT_SECRET: "local-secret",
+      now: () => Date.parse("2026-10-02T12:00:00.000Z"),
     };
     const artifactId = "________________________________";
 
@@ -46,6 +47,7 @@ describe("Worker HTTP interface", () => {
         headers: {
           authorization: "Bearer local-secret",
           "content-type": "text/html; charset=utf-8",
+          "x-arty-lifetime-ms": String(7 * 86_400_000),
         },
         method: "PUT",
       }),
@@ -53,6 +55,10 @@ describe("Worker HTTP interface", () => {
     );
 
     expect(publishResponse.status).toBe(201);
+    expect(await publishResponse.json()).toEqual({
+      createdAt: "2026-10-02T12:00:00.000Z",
+      expiresAt: "2026-10-09T12:00:00.000Z",
+    });
     const viewerResponse = await worker.fetch(
       new Request(`https://arty.test/${artifactId}/`),
       environment,
@@ -60,6 +66,9 @@ describe("Worker HTTP interface", () => {
     expect(viewerResponse.status).toBe(200);
     expect(viewerResponse.headers.get("content-type")).toBe(
       "text/html; charset=utf-8",
+    );
+    expect(viewerResponse.headers.get("cache-control")).toBe(
+      "private, no-cache",
     );
     expect(await viewerResponse.text()).toBe("<h1>Hello from Arty</h1>");
   });
@@ -103,7 +112,10 @@ describe("Worker HTTP interface", () => {
       worker.fetch(
         new Request(url, {
           body,
-          headers: { authorization: "Bearer local-secret" },
+          headers: {
+            authorization: "Bearer local-secret",
+            "x-arty-lifetime-ms": "60000",
+          },
           method: "PUT",
         }),
         environment,
@@ -116,5 +128,123 @@ describe("Worker HTTP interface", () => {
       environment,
     );
     expect(await viewerResponse.text()).toBe("original");
+  });
+
+  test.each([
+    ["missing", undefined],
+    ["below minimum", "59999"],
+    ["above maximum", String(30 * 86_400_000 + 1)],
+    ["not an integer", "60000.5"],
+  ])(
+    "rejects a %s Lifetime before reading the body",
+    async (_name, lifetime) => {
+      const environment: WorkerEnvironment = {
+        ARTIFACTS: new MemoryR2(),
+        MANAGEMENT_SECRET: "local-secret",
+      };
+      const headers: Record<string, string> = {
+        authorization: "Bearer local-secret",
+      };
+      if (lifetime !== undefined) headers["x-arty-lifetime-ms"] = lifetime;
+
+      const response = await worker.fetch(
+        new Request(
+          "https://arty.test/_arty/artifacts/________________________________",
+          { body: "content", headers, method: "PUT" },
+        ),
+        environment,
+      );
+
+      expect(response.status).toBe(400);
+    },
+  );
+
+  test.each([
+    ["minimum", 60_000],
+    ["maximum", 30 * 86_400_000],
+  ])("accepts the %s Lifetime", async (_name, lifetime) => {
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: new MemoryR2(),
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => 0,
+    };
+
+    const response = await worker.fetch(
+      new Request(
+        "https://arty.test/_arty/artifacts/________________________________",
+        {
+          body: "content",
+          headers: {
+            authorization: "Bearer local-secret",
+            "x-arty-lifetime-ms": String(lifetime),
+          },
+          method: "PUT",
+        },
+      ),
+      environment,
+    );
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      createdAt: "1970-01-01T00:00:00.000Z",
+      expiresAt: new Date(lifetime).toISOString(),
+    });
+  });
+
+  test("uses the Worker clock at commit and denies access at the instant of expiry", async () => {
+    const bucket = new MemoryR2();
+    let now = Date.parse("2026-10-02T12:00:00.000Z");
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: bucket,
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => now,
+    };
+    const artifactId = "________________________________";
+    const publishResponse = await worker.fetch(
+      new Request(`https://arty.test/_arty/artifacts/${artifactId}`, {
+        body: "temporary",
+        headers: {
+          authorization: "Bearer local-secret",
+          "x-arty-lifetime-ms": "60000",
+        },
+        method: "PUT",
+      }),
+      environment,
+    );
+    expect(await publishResponse.json()).toEqual({
+      createdAt: "2026-10-02T12:00:00.000Z",
+      expiresAt: "2026-10-02T12:01:00.000Z",
+    });
+
+    now += 59_999;
+    expect(
+      (
+        await worker.fetch(
+          new Request(`https://arty.test/${artifactId}/`),
+          environment,
+        )
+      ).status,
+    ).toBe(200);
+    now += 1;
+    const expired = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/`),
+      environment,
+    );
+    const unknown = await worker.fetch(
+      new Request("https://arty.test/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/"),
+      environment,
+    );
+    expect({ status: expired.status, body: await expired.text() }).toEqual({
+      status: unknown.status,
+      body: await unknown.text(),
+    });
+    const expiredPost = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/`, { method: "POST" }),
+      environment,
+    );
+    expect({
+      status: expiredPost.status,
+      body: await expiredPost.text(),
+    }).toEqual({ status: unknown.status, body: "Not found" });
   });
 });

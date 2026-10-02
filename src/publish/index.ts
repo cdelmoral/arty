@@ -41,8 +41,12 @@ const readSource = async (path: string): Promise<Uint8Array> => {
 
 export const publish = (
   path: string,
+  lifetimeMilliseconds: number,
   environment: PublishEnvironment,
-): Effect.Effect<string, PublishError> =>
+): Effect.Effect<
+  { readonly accessUrl: string; readonly expiresAt: string },
+  PublishError
+> =>
   Effect.tryPromise({
     try: async () => {
       const content = await readSource(path);
@@ -53,6 +57,7 @@ export const publish = (
       return environment.provider.publish({
         artifactId: artifactIdFrom(randomBytes),
         content,
+        lifetimeMilliseconds,
       });
     },
     catch: (error) =>

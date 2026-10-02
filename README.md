@@ -2,6 +2,8 @@
 
 Arty is a CLI for publishing a local static Source as a temporary Artifact in a Publisher-owned Cloudflare account.
 
+Artifacts expire after seven days by default. Publishers can configure another default or pass `--lifetime` when publishing, from `1m` through `30d`. Expiry stops later remote access, but it cannot erase copies that a Viewer downloaded before expiry.
+
 The project is under active development. The current executable provides the CLI foundation:
 
 ```sh
