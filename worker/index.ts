@@ -5,6 +5,7 @@ interface R2ObjectBody {
 }
 
 interface R2BucketBinding {
+  delete(key: string): Promise<void>;
   get(key: string): Promise<R2ObjectBody | null>;
   put(
     key: string,
@@ -39,7 +40,7 @@ const fetch = async (
     if (request.headers.has("origin"))
       return new Response(null, { status: 403 });
     if (
-      request.method !== "PUT" ||
+      !["DELETE", "PUT"].includes(request.method) ||
       request.headers.get("authorization") !==
         `Bearer ${environment.MANAGEMENT_SECRET}`
     ) {
@@ -48,6 +49,35 @@ const fetch = async (
 
     const artifactId = managementMatch[1] ?? "";
     if (!artifactIdPattern.test(artifactId)) return notFound();
+    if (request.method === "DELETE") {
+      const operationId = request.headers.get("x-arty-operation-id") ?? "";
+      if (!artifactIdPattern.test(operationId)) {
+        return new Response(null, { status: 400 });
+      }
+      const receiptKey = `deletions/${artifactId}/${operationId}`;
+      const manifestKey = `manifests/${artifactId}.json`;
+      const manifestObject = await environment.ARTIFACTS.get(manifestKey);
+      if (manifestObject === null) {
+        return (await environment.ARTIFACTS.get(receiptKey)) === null
+          ? notFound()
+          : new Response(null, { status: 204 });
+      }
+      const manifest = JSON.parse(
+        new TextDecoder().decode(await manifestObject.arrayBuffer()),
+      ) as ArtifactManifest;
+      await environment.ARTIFACTS.put(receiptKey, "deleted", {
+        onlyIf: { etagDoesNotMatch: "*" },
+      });
+      await environment.ARTIFACTS.delete(manifestKey);
+      try {
+        await environment.ARTIFACTS.delete(
+          `staging/${artifactId}/${manifest.path}`,
+        );
+      } catch {
+        // The missing manifest has already ended Viewer access.
+      }
+      return new Response(null, { status: 204 });
+    }
     const content = await request.arrayBuffer();
     const staged = await environment.ARTIFACTS.put(
       `staging/${artifactId}/index.html`,
