@@ -166,6 +166,13 @@ export const setCloudflareConfig = async (
 ): Promise<void> =>
   writeConfig(runtime, { ...(await readConfig(runtime)), cloudflare });
 
+export const clearCloudflareConfig = async (
+  runtime: ConfigEnvironment,
+): Promise<void> => {
+  const { cloudflare: _cloudflare, ...config } = await readConfig(runtime);
+  await writeConfig(runtime, config);
+};
+
 export const getDefaultLifetime = async (
   runtime: ConfigEnvironment,
 ): Promise<string> => {

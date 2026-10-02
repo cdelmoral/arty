@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  createCloudflareDestroyer,
   createCloudflareProvisioner,
+  DestructionError,
   InitializationError,
 } from "../../src/cloudflare";
 
@@ -179,4 +181,164 @@ describe("Cloudflare provisioning interface", () => {
       "The Arty Worker was upgraded to the current management protocol.",
     ]);
   });
+});
+
+describe("Cloudflare destruction interface", () => {
+  test("stops access before removing every owned resource without changing the subdomain", async () => {
+    const requests: Array<Request> = [];
+    const destroyer = createCloudflareDestroyer(async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (
+        request.method === "GET" &&
+        request.url.endsWith("/workers/scripts/arty")
+      ) {
+        return new Response('const ARTY_OWNER = "arty";');
+      }
+      if (
+        request.method === "GET" &&
+        request.url.endsWith("/r2/buckets/arty-content")
+      ) {
+        return success({ name: "arty-content" });
+      }
+      if (request.method === "GET" && request.url.endsWith("/lifecycle")) {
+        return success({ rules: [{ id: "arty-owner-v1-storage-backstop" }] });
+      }
+      return success();
+    });
+
+    await destroyer.destroy({
+      accountId: "account-123",
+      bucketName: "arty-content",
+      token: "api-token",
+      workerName: "arty",
+    });
+
+    const mutations = requests.filter((request) => request.method !== "GET");
+    expect(
+      mutations.map((request) => [
+        request.method,
+        new URL(request.url).pathname,
+      ]),
+    ).toEqual([
+      [
+        "PATCH",
+        "/client/v4/accounts/account-123/workers/services/arty/environments/production/settings",
+      ],
+      [
+        "DELETE",
+        "/client/v4/accounts/account-123/workers/scripts/arty/schedules",
+      ],
+      [
+        "DELETE",
+        "/client/v4/accounts/account-123/r2/buckets/arty-content/objects",
+      ],
+      [
+        "DELETE",
+        "/client/v4/accounts/account-123/r2/buckets/arty-content/lifecycle",
+      ],
+      ["DELETE", "/client/v4/accounts/account-123/r2/buckets/arty-content"],
+      [
+        "DELETE",
+        "/client/v4/accounts/account-123/workers/scripts/arty/secrets/MANAGEMENT_SECRET",
+      ],
+      ["DELETE", "/client/v4/accounts/account-123/workers/scripts/arty"],
+    ]);
+    expect(
+      requests.some((request) => request.url.endsWith("/workers/subdomain")),
+    ).toBe(false);
+  });
+
+  test("refuses drift before changing any resource", async () => {
+    let mutations = 0;
+    const destroyer = createCloudflareDestroyer(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method !== "GET") mutations += 1;
+      if (request.url.endsWith("/workers/scripts/arty")) {
+        return new Response("unrelated worker");
+      }
+      if (request.url.endsWith("/r2/buckets/arty-content")) return success();
+      if (request.url.endsWith("/lifecycle")) {
+        return success({ rules: [{ id: "arty-owner-v1-storage-backstop" }] });
+      }
+      return success();
+    });
+
+    await expect(
+      destroyer.destroy({
+        accountId: "account-123",
+        bucketName: "arty-content",
+        token: "api-token",
+        workerName: "arty",
+      }),
+    ).rejects.toBeInstanceOf(DestructionError);
+    expect(mutations).toBe(0);
+  });
+
+  test("resumes when earlier destruction stages already removed resources", async () => {
+    const mutations: Array<string> = [];
+    const destroyer = createCloudflareDestroyer(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return new Response(null, { status: 404 });
+      mutations.push(request.url);
+      return new Response(null, { status: 404 });
+    });
+
+    await destroyer.destroy({
+      accountId: "account-123",
+      bucketName: "arty-content",
+      token: "api-token",
+      workerName: "arty",
+    });
+
+    expect(mutations).toEqual([]);
+  });
+
+  test.each([
+    "/environments/production/settings",
+    "/schedules",
+    "/objects",
+    "/lifecycle",
+    "/r2/buckets/arty-content",
+    "/secrets/MANAGEMENT_SECRET",
+    "/workers/scripts/arty",
+  ])(
+    "stops at a failed destruction stage and reports it: %s",
+    async (failedPath) => {
+      let failed = false;
+      const destroyer = createCloudflareDestroyer(async (input, init) => {
+        const request = new Request(input, init);
+        if (
+          request.method === "GET" &&
+          request.url.endsWith("/workers/scripts/arty")
+        ) {
+          return new Response('const ARTY_OWNER = "arty";');
+        }
+        if (
+          request.method === "GET" &&
+          request.url.endsWith("/r2/buckets/arty-content")
+        ) {
+          return success();
+        }
+        if (request.method === "GET" && request.url.endsWith("/lifecycle")) {
+          return success({ rules: [{ id: "arty-owner-v1-storage-backstop" }] });
+        }
+        if (!failed && request.url.endsWith(failedPath)) {
+          failed = true;
+          return new Response(null, { status: 503 });
+        }
+        return success();
+      });
+
+      await expect(
+        destroyer.destroy({
+          accountId: "account-123",
+          bucketName: "arty-content",
+          token: "api-token",
+          workerName: "arty",
+        }),
+      ).rejects.toBeInstanceOf(DestructionError);
+      expect(failed).toBe(true);
+    },
+  );
 });
