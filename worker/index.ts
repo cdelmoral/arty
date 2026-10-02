@@ -53,6 +53,15 @@ const minimumLifetimeMilliseconds = 60_000;
 const maximumLifetimeMilliseconds = 30 * 86_400_000;
 
 const notFound = (): Response => new Response("Not found", { status: 404 });
+const viewerHeaders = (): Headers =>
+  new Headers({
+    "cache-control": "private, no-cache",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-robots-tag": "noindex, nofollow, noarchive",
+  });
+const viewerNotFound = (): Response =>
+  new Response("Not found", { headers: viewerHeaders(), status: 404 });
 const validPath = (path: string): boolean =>
   path !== "" &&
   !path.startsWith("/") &&
@@ -75,6 +84,51 @@ const authenticated = (
 const compatibleProtocol = (request: Request): boolean =>
   request.headers.get("x-arty-protocol-version") ===
   String(MANAGEMENT_PROTOCOL_VERSION);
+
+const createEtag = async (body: ArrayBuffer): Promise<string> => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+  return `"${Array.from(digest, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")}"`;
+};
+
+const etagMatches = (header: string, etag: string): boolean =>
+  header
+    .split(",")
+    .map((value) => value.trim().replace(/^W\//, ""))
+    .some((value) => value === "*" || value === etag);
+
+const parseRange = (
+  header: string,
+  size: number,
+): { end: number; start: number } | "unsatisfiable" | null => {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (match === null || (match[1] === "" && match[2] === "")) return null;
+
+  if (match[1] === "") {
+    const suffixLength = Number(match[2]);
+    if (
+      !Number.isSafeInteger(suffixLength) ||
+      suffixLength <= 0 ||
+      size === 0
+    ) {
+      return "unsatisfiable";
+    }
+    return { start: Math.max(size - suffixLength, 0), end: size - 1 };
+  }
+
+  const start = Number(match[1]);
+  const requestedEnd = match[2] === "" ? size - 1 : Number(match[2]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    start >= size ||
+    requestedEnd < start
+  ) {
+    return "unsatisfiable";
+  }
+  return { start, end: Math.min(requestedEnd, size - 1) };
+};
 
 const fetch = async (
   request: Request,
@@ -377,39 +431,89 @@ const fetch = async (
   const viewerMatch = /^\/([^/]+)\/(.*)$/.exec(url.pathname);
   const artifactId = viewerMatch?.[1];
   if (artifactId === undefined || !artifactIdPattern.test(artifactId)) {
-    return notFound();
+    return viewerNotFound();
   }
   const manifestObject = await environment.ARTIFACTS.get(
     `manifests/${artifactId}.json`,
   );
-  if (manifestObject === null) return notFound();
+  if (manifestObject === null) return viewerNotFound();
   const manifest = JSON.parse(
     new TextDecoder().decode(await manifestObject.arrayBuffer()),
   ) as ArtifactManifest;
   if ((environment.now ?? Date.now)() >= Date.parse(manifest.expiresAt)) {
-    return notFound();
+    return viewerNotFound();
   }
-  if (request.method !== "GET") {
-    return new Response(null, { status: 405 });
+  if (!["GET", "HEAD"].includes(request.method)) {
+    const headers = viewerHeaders();
+    headers.set("allow", "GET, HEAD");
+    return new Response(null, { headers, status: 405 });
   }
   let requestedPath: string;
   try {
-    requestedPath = decodeURIComponent(viewerMatch?.[2] ?? "") || "index.html";
+    requestedPath = decodeURIComponent(viewerMatch?.[2] ?? "");
   } catch {
-    return notFound();
+    return viewerNotFound();
   }
-  const file = manifest.files.find(({ path }) => path === requestedPath);
-  if (file === undefined) return notFound();
+  if (requestedPath === "" || requestedPath.endsWith("/")) {
+    requestedPath += "index.html";
+  }
+  let file = manifest.files.find(({ path }) => path === requestedPath);
+  if (file === undefined && !requestedPath.endsWith("/")) {
+    file = manifest.files.find(
+      ({ path }) => path === `${requestedPath}/index.html`,
+    );
+    if (file !== undefined) {
+      url.pathname += "/";
+      return new Response(null, {
+        headers: new Headers({
+          ...Object.fromEntries(viewerHeaders()),
+          location: url.href,
+        }),
+        status: 308,
+      });
+    }
+  }
+  if (file === undefined) return viewerNotFound();
   const source = await environment.ARTIFACTS.get(
     `staging/${artifactId}/${file.path}`,
   );
-  if (source === null) return notFound();
-  return new Response(await source.arrayBuffer(), {
-    headers: {
-      "cache-control": "private, no-cache",
-      "content-type": file.contentType,
-    },
-  });
+  if (source === null) return viewerNotFound();
+
+  const body = await source.arrayBuffer();
+  const etag = await createEtag(body);
+  const headers = viewerHeaders();
+  headers.set("accept-ranges", "bytes");
+  headers.set("content-length", String(body.byteLength));
+  headers.set("content-type", file.contentType);
+  headers.set("etag", etag);
+
+  const ifNoneMatch = request.headers.get("if-none-match");
+  if (ifNoneMatch !== null && etagMatches(ifNoneMatch, etag)) {
+    headers.delete("content-length");
+    return new Response(null, { headers, status: 304 });
+  }
+
+  const rangeHeader = request.headers.get("range");
+  const range =
+    rangeHeader === null ? null : parseRange(rangeHeader, body.byteLength);
+  if (range === "unsatisfiable") {
+    headers.set("content-range", `bytes */${body.byteLength}`);
+    headers.delete("content-length");
+    return new Response(null, { headers, status: 416 });
+  }
+  if (range !== null) {
+    const partial = body.slice(range.start, range.end + 1);
+    headers.set("content-length", String(partial.byteLength));
+    headers.set(
+      "content-range",
+      `bytes ${range.start}-${range.end}/${body.byteLength}`,
+    );
+    return new Response(request.method === "HEAD" ? null : partial, {
+      headers,
+      status: 206,
+    });
+  }
+  return new Response(request.method === "HEAD" ? null : body, { headers });
 };
 
 export default { fetch };

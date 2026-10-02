@@ -121,6 +121,63 @@ describe("Worker HTTP interface", () => {
     expect(bucket.objects.size).toBe(0);
   });
 
+  const publishSite = async (
+    environment: WorkerEnvironment,
+    artifactId = "________________________________",
+  ) => {
+    const files = [
+      {
+        content: "root page",
+        contentType: "text/html; charset=utf-8",
+        path: "index.html",
+      },
+      {
+        content: "nested page",
+        contentType: "text/html; charset=utf-8",
+        path: "guide/index.html",
+      },
+      {
+        content: "0123456789",
+        contentType: "application/octet-stream",
+        path: "asset.bin",
+      },
+    ];
+    const root = `https://arty.test/_arty/artifacts/${artifactId}`;
+    const headers = {
+      authorization: "Bearer local-secret",
+      "x-arty-protocol-version": "1",
+    };
+    for (const file of files) {
+      const response = await worker.fetch(
+        new Request(`${root}/files/${encodeURIComponent(file.path)}`, {
+          body: file.content,
+          headers: {
+            ...headers,
+            "content-type": file.contentType,
+            "x-arty-file-size": String(file.content.length),
+          },
+          method: "PUT",
+        }),
+        environment,
+      );
+      expect(response.status).toBe(204);
+    }
+    const response = await worker.fetch(
+      new Request(`${root}/commit`, {
+        body: JSON.stringify({
+          files: files.map(({ content, ...file }) => ({
+            ...file,
+            size: content.length,
+          })),
+        }),
+        headers: { ...headers, "x-arty-lifetime-ms": "60000" },
+        method: "POST",
+      }),
+      environment,
+    );
+    expect(response.status).toBe(201);
+  };
+
   test("commits and serves only files declared by a directory Artifact", async () => {
     const bucket = new MemoryR2();
     const environment: WorkerEnvironment = {
@@ -445,5 +502,112 @@ describe("Worker HTTP interface", () => {
     ).toBe(404);
     expect((await remove("________________________________")).status).toBe(204);
     expect((await remove("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).status).toBe(404);
+  });
+
+  test("serves directory indexes and redirects directory paths", async () => {
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: new MemoryR2(),
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => 0,
+    };
+    const artifactId = "________________________________";
+    await publishSite(environment, artifactId);
+
+    const index = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/guide/`),
+      environment,
+    );
+    expect(index.status).toBe(200);
+    expect(await index.text()).toBe("nested page");
+
+    const redirect = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/guide?mode=review`),
+      environment,
+    );
+    expect(redirect.status).toBe(308);
+    expect(redirect.headers.get("location")).toBe(
+      `https://arty.test/${artifactId}/guide/?mode=review`,
+    );
+    expect(
+      (
+        await worker.fetch(
+          new Request(`https://arty.test/${artifactId}/missing`),
+          environment,
+        )
+      ).status,
+    ).toBe(404);
+  });
+
+  test("supports HEAD, validators, and byte ranges", async () => {
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: new MemoryR2(),
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => 0,
+    };
+    const artifactId = "________________________________";
+    await publishSite(environment, artifactId);
+    const url = `https://arty.test/${artifactId}/asset.bin`;
+
+    const initial = await worker.fetch(new Request(url), environment);
+    const etag = initial.headers.get("etag");
+    expect(etag).toMatch(/^"[a-f0-9]{64}"$/);
+    expect(initial.headers.get("content-length")).toBe("10");
+
+    const head = await worker.fetch(
+      new Request(url, { method: "HEAD" }),
+      environment,
+    );
+    expect(head.status).toBe(200);
+    expect(head.headers.get("etag")).toBe(etag);
+    expect(head.headers.get("content-length")).toBe("10");
+    expect(await head.text()).toBe("");
+
+    const unchanged = await worker.fetch(
+      new Request(url, { headers: { "if-none-match": etag ?? "" } }),
+      environment,
+    );
+    expect(unchanged.status).toBe(304);
+    expect(await unchanged.text()).toBe("");
+
+    const partial = await worker.fetch(
+      new Request(url, { headers: { range: "bytes=2-5" } }),
+      environment,
+    );
+    expect(partial.status).toBe(206);
+    expect(partial.headers.get("content-range")).toBe("bytes 2-5/10");
+    expect(partial.headers.get("content-length")).toBe("4");
+    expect(await partial.text()).toBe("2345");
+
+    const unsatisfiable = await worker.fetch(
+      new Request(url, { headers: { range: "bytes=10-" } }),
+      environment,
+    );
+    expect(unsatisfiable.status).toBe(416);
+    expect(unsatisfiable.headers.get("content-range")).toBe("bytes */10");
+  });
+
+  test("applies Viewer method and security header policy", async () => {
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: new MemoryR2(),
+      MANAGEMENT_SECRET: "local-secret",
+      now: () => 0,
+    };
+    const artifactId = "________________________________";
+    await publishSite(environment, artifactId);
+
+    const response = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/`, { method: "POST" }),
+      environment,
+    );
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("GET, HEAD");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-robots-tag")).toBe(
+      "noindex, nofollow, noarchive",
+    );
+    expect(response.headers.get("cache-control")).toBe("private, no-cache");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.has("content-security-policy")).toBe(false);
+    expect(response.headers.has("access-control-allow-origin")).toBe(false);
   });
 });
