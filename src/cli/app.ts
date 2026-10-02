@@ -26,6 +26,7 @@ import { createConfiguredCloudflareProvider, type Provider } from "../provider";
 import { publish, PublishError } from "../publish";
 
 export interface CliOutput {
+  readonly stderrIsInteractive?: boolean;
   readonly writeStderr: (text: string) => void;
   readonly writeStdout: (text: string) => void;
 }
@@ -43,6 +44,7 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
     .name("arty")
     .description("Publish temporary static Artifacts from local Sources.")
     .version("0.1.0")
+    .option("--verbose", "show detailed diagnostics on stderr")
     .configureOutput({
       writeErr: output.writeStderr,
       writeOut: output.writeStdout,
@@ -51,6 +53,13 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
 
   const publishSource = async (path: string, lifetime?: string) => {
     const selectedLifetime = lifetime ?? (await getDefaultLifetime(runtime));
+    if (output.stderrIsInteractive)
+      output.writeStderr("Publishing Artifact...\n");
+    if (program.opts<{ verbose?: boolean }>().verbose) {
+      output.writeStderr(
+        `Publishing Source with Lifetime ${selectedLifetime}.\n`,
+      );
+    }
     const result = await Effect.runPromise(
       publish(path, lifetimeInMilliseconds(selectedLifetime), runtime),
     );

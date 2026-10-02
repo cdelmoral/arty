@@ -3,17 +3,22 @@ import type { ConfigEnvironment } from "../config";
 import { getCloudflareConfig } from "../config";
 import type { CredentialStore } from "../credentials";
 import { resolveCredential } from "../credentials";
+import { MANAGEMENT_PROTOCOL_VERSION } from "../shared/protocol";
 
 export interface PublishFile {
-  readonly content: Uint8Array;
+  readonly content?: Uint8Array;
   readonly contentType: string;
+  readonly open?: () => ReadableStream<Uint8Array>;
   readonly path: string;
+  readonly size?: number;
+  readonly verify?: () => Promise<void>;
 }
 
 export interface PublishRequest {
   readonly artifactId: string;
   readonly files: ReadonlyArray<PublishFile>;
   readonly lifetimeMilliseconds: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface PublishResult {
@@ -44,6 +49,12 @@ type ProviderFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export interface ProviderRetryOptions {
+  readonly now?: () => number;
+  readonly random?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+}
+
 const retryableStatus = (status: number): boolean =>
   status === 429 || [500, 502, 503, 504].includes(status);
 
@@ -51,6 +62,7 @@ export const createLocalWorkerProvider = (
   workerUrl: string | undefined,
   managementSecret: string | undefined,
   request: ProviderFetch = fetch,
+  retryOptions: ProviderRetryOptions = {},
 ): Provider => ({
   delete: async ({ artifactId, operationId }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
@@ -90,7 +102,7 @@ export const createLocalWorkerProvider = (
       );
     }
   },
-  publish: async ({ artifactId, files, lifetimeMilliseconds }) => {
+  publish: async ({ artifactId, files, lifetimeMilliseconds, signal }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
       throw new ProviderError(
         "ARTY_WORKER_URL and ARTY_MANAGEMENT_SECRET are required to publish.",
@@ -98,40 +110,128 @@ export const createLocalWorkerProvider = (
     }
 
     const baseUrl = workerUrl.replace(/\/$/, "");
-    const response = await request(`${baseUrl}/_arty/artifacts/${artifactId}`, {
-      body: JSON.stringify({
-        files: files.map((file) => ({
-          content: Buffer.from(file.content).toString("base64"),
-          contentType: file.contentType,
-          path: file.path,
-        })),
-      }),
-      headers: {
-        authorization: `Bearer ${managementSecret}`,
-        "content-type": "application/json",
-        "x-arty-lifetime-ms": String(lifetimeMilliseconds),
-      },
-      method: "PUT",
-    });
-    if (!response.ok) {
+    const commonHeaders = {
+      authorization: `Bearer ${managementSecret}`,
+      "x-arty-protocol-version": String(MANAGEMENT_PROTOCOL_VERSION),
+    };
+    const sleep =
+      retryOptions.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
+    const random = retryOptions.random ?? Math.random;
+    const now = retryOptions.now ?? Date.now;
+    const send = async (
+      url: string,
+      init: () => RequestInit,
+    ): Promise<Response> => {
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        let response: Response;
+        const requestInit = init();
+        try {
+          response = await request(url, requestInit);
+        } catch (error) {
+          lastError = error;
+          if (requestInit.signal?.aborted) throw error;
+          if (attempt === 3) break;
+          await sleep(100 * 2 ** attempt * (0.5 + random()));
+          continue;
+        }
+        if (!retryableStatus(response.status) || attempt === 3) return response;
+        const retryAfter = response.headers.get("retry-after");
+        const seconds = retryAfter === null ? Number.NaN : Number(retryAfter);
+        const date = retryAfter === null ? Number.NaN : Date.parse(retryAfter);
+        const delay = Number.isFinite(seconds)
+          ? seconds * 1_000
+          : Number.isFinite(date)
+            ? Math.max(0, date - now())
+            : 100 * 2 ** attempt * (0.5 + random());
+        await sleep(delay);
+      }
+      throw new ProviderError("Provider publication request failed.", {
+        cause: lastError,
+      });
+    };
+    const reject = async (response: Response): Promise<never> => {
+      if (response.status === 426) {
+        throw new ProviderError(
+          "Management protocol mismatch. Run `arty init cloudflare`.",
+        );
+      }
       throw new ProviderError(
         `Provider rejected publication (${response.status}).`,
       );
-    }
-
-    const result = (await response.json()) as {
-      readonly expiresAt?: unknown;
     };
-    if (typeof result.expiresAt !== "string") {
-      throw new ProviderError(
-        "Provider returned an invalid publication result.",
+
+    try {
+      for (const file of files) {
+        const size = file.size ?? file.content?.byteLength;
+        if (size === undefined)
+          throw new ProviderError("Source file size is unavailable.");
+        const response = await send(
+          `${baseUrl}/_arty/artifacts/${artifactId}/files/${encodeURIComponent(file.path)}`,
+          () => ({
+            body:
+              file.open?.() ??
+              (file.content === undefined
+                ? undefined
+                : new Blob([Uint8Array.from(file.content)])),
+            headers: {
+              ...commonHeaders,
+              "content-type": file.contentType,
+              "x-arty-file-size": String(size),
+            },
+            method: "PUT",
+            signal,
+          }),
+        );
+        if (!response.ok) await reject(response);
+        await file.verify?.();
+      }
+
+      const response = await send(
+        `${baseUrl}/_arty/artifacts/${artifactId}/commit`,
+        () => ({
+          body: JSON.stringify({
+            files: files.map(({ contentType, path, size, content }) => ({
+              contentType,
+              path,
+              size: size ?? content?.byteLength,
+            })),
+          }),
+          headers: {
+            ...commonHeaders,
+            "content-type": "application/json",
+            "x-arty-lifetime-ms": String(lifetimeMilliseconds),
+          },
+          method: "POST",
+          signal,
+        }),
       );
-    }
+      if (!response.ok) await reject(response);
 
-    return {
-      accessUrl: `${baseUrl}/${artifactId}/`,
-      expiresAt: result.expiresAt,
-    };
+      const result = (await response.json()) as {
+        readonly expiresAt?: unknown;
+      };
+      if (typeof result.expiresAt !== "string") {
+        throw new ProviderError(
+          "Provider returned an invalid publication result.",
+        );
+      }
+
+      return {
+        accessUrl: `${baseUrl}/${artifactId}/`,
+        expiresAt: result.expiresAt,
+      };
+    } catch (error) {
+      try {
+        await request(`${baseUrl}/_arty/artifacts/${artifactId}`, {
+          headers: { ...commonHeaders, "x-arty-operation-id": artifactId },
+          method: "DELETE",
+        });
+      } catch {
+        // Cleanup is best effort; preserve the publication failure.
+      }
+      throw error;
+    }
   },
 });
 

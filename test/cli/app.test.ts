@@ -127,7 +127,7 @@ describe("CLI application", () => {
     expect(requests[0]?.artifactId).toBe("________________________________");
     expect(requests[0]?.lifetimeMilliseconds).toBe(7 * 86_400_000);
     expect(requests[0]?.files[0]?.path).toBe("index.html");
-    expect(new TextDecoder().decode(requests[0]?.files[0]?.content)).toBe(
+    expect(await new Response(requests[0]?.files[0]?.open?.()).text()).toBe(
       "<h1>Hello from Arty</h1>",
     );
   });
@@ -384,11 +384,15 @@ describe("CLI application", () => {
 
     expect(result.exitCode).toBe(0);
     expect(
-      requests[0]?.files.map(({ path, contentType, content }) => ({
-        path,
-        contentType,
-        content: [...content],
-      })),
+      await Promise.all(
+        (requests[0]?.files ?? []).map(async ({ path, contentType, open }) => ({
+          path,
+          contentType,
+          content: [
+            ...new Uint8Array(await new Response(open?.()).arrayBuffer()),
+          ],
+        })),
+      ),
     ).toEqual([
       {
         path: "assets/app.css",
@@ -487,7 +491,7 @@ describe("CLI application", () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  --lifetime <duration>      Lifetime for this Artifact\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  --verbose                  show detailed diagnostics on stderr\n  --lifetime <duration>      Lifetime for this Artifact\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
     });
   });
 
