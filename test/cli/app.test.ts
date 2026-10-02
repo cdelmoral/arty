@@ -644,6 +644,96 @@ describe("CLI application", () => {
     });
   });
 
+  test("preserves the management secret when initialization is repeated", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
+    temporaryDirectories.push(configHome);
+    await mkdir(join(configHome, "arty"), { recursive: true });
+    await Bun.write(
+      join(configHome, "arty", "config.json"),
+      '{"cloudflare":{"accountId":"account-123","bucketName":"arty-content","protocolVersion":1,"workerName":"arty","workerUrl":"https://arty.old-publisher.workers.dev"}}',
+    );
+    const credentials = new Map([
+      ["cloudflare:account-123:management-secret", "existing-secret"],
+    ]);
+    const requests: Array<CloudflareProvisionRequest> = [];
+
+    const result = await invoke(
+      ["init", "cloudflare", "--yes"],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "token",
+        XDG_CONFIG_HOME: configHome,
+      },
+      {
+        credentialStore: {
+          delete: async () => {},
+          get: async (account) => credentials.get(account),
+          set: async (account, value) => void credentials.set(account, value),
+        },
+        provisioner: {
+          getWorkersSubdomain: async () => "publisher",
+          provision: async (request) => {
+            requests.push(request);
+            return { workerUrl: "https://arty.publisher.workers.dev" };
+          },
+        },
+        randomBytes: () => {
+          throw new Error("A replacement secret must not be generated");
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(requests[0]?.managementSecret).toBe("existing-secret");
+    expect(result.stderr).toContain("existing Access URLs may no longer work");
+    expect(result.stderr).toContain("will not rename the account subdomain");
+  });
+
+  test("requires confirmation before replacing a missing management secret", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
+    temporaryDirectories.push(configHome);
+    await mkdir(join(configHome, "arty"), { recursive: true });
+    await Bun.write(
+      join(configHome, "arty", "config.json"),
+      '{"cloudflare":{"accountId":"account-123","bucketName":"arty-content","protocolVersion":1,"workerName":"arty","workerUrl":"https://arty.publisher.workers.dev"}}',
+    );
+    const confirmations: Array<string> = [];
+    let provisionCalls = 0;
+
+    const result = await invoke(
+      ["init", "cloudflare", "--yes"],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "token",
+        XDG_CONFIG_HOME: configHome,
+      },
+      {
+        initialization: {
+          confirm: async (message) => {
+            confirmations.push(message);
+            return false;
+          },
+          promptSecret: async () => "",
+          promptText: async () => "",
+        },
+        provisioner: {
+          getWorkersSubdomain: async () => "publisher",
+          provision: async () => {
+            provisionCalls += 1;
+            return { workerUrl: "https://arty.publisher.workers.dev" };
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("another installation will stop working");
+    expect(confirmations).toEqual([
+      "Rotate the missing management secret and continue? ",
+    ]);
+    expect(provisionCalls).toBe(0);
+  });
+
   test("asks for a missing workers.dev subdomain and explains its account scope", async () => {
     const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
     temporaryDirectories.push(configHome);

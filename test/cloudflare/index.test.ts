@@ -107,4 +107,55 @@ describe("Cloudflare provisioning interface", () => {
       }),
     ).rejects.toBeInstanceOf(InitializationError);
   });
+
+  test("reconciles owned resources without creating duplicates and upgrades the Worker", async () => {
+    const requests: Array<Request> = [];
+    const provisioner = createCloudflareProvisioner(async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (
+        request.method === "GET" &&
+        request.url.endsWith("/workers/scripts/arty")
+      ) {
+        return new Response('const ARTY_OWNER = "arty";');
+      }
+      if (
+        request.method === "GET" &&
+        request.url.endsWith("/r2/buckets/arty-content/lifecycle")
+      ) {
+        return success({
+          rules: [{ id: "arty-owner-v1-storage-backstop" }],
+        });
+      }
+      return success();
+    });
+
+    const result = await provisioner.provision({
+      accountId: "account-123",
+      allowExisting: true,
+      bucketName: "arty-content",
+      createSubdomain: false,
+      managementSecret: "management-secret",
+      subdomain: "publisher",
+      token: "api-token",
+      workerName: "arty",
+    });
+
+    expect(
+      requests.some(
+        (request) =>
+          request.method === "POST" && request.url.endsWith("/r2/buckets"),
+      ),
+    ).toBe(false);
+    expect(
+      requests.some(
+        (request) =>
+          request.method === "PUT" &&
+          request.url.endsWith("/workers/scripts/arty"),
+      ),
+    ).toBe(true);
+    expect(result.warnings).toEqual([
+      "The Arty Worker was upgraded to the current management protocol.",
+    ]);
+  });
 });
