@@ -21,6 +21,20 @@ describe("release configuration", () => {
     expect(workflow).toContain("bun run verify:archive");
   });
 
+  test("provisions an isolated writable Keychain for macOS native smoke tests", async () => {
+    for (const path of [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+    ]) {
+      const workflow = await read(path);
+      expect(workflow).toContain("security create-keychain");
+      expect(workflow).toContain("security unlock-keychain");
+      expect(workflow).toContain("security list-keychains -d user -s");
+      expect(workflow).toContain("security default-keychain -d user -s");
+      expect(workflow).toContain("_credential-smoke-test");
+    }
+  });
+
   test("publishes verified outputs without publishing an npm package", async () => {
     const workflow = await read(".github/workflows/release.yml");
 

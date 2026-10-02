@@ -73,7 +73,16 @@ jobs:
       - name: Smoke test macOS Keychain
         if: runner.os == 'macOS'
         shell: bash
-        run: ARTY_CREDENTIAL_SMOKE_VALUE="ci-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "ci-${{ matrix.target }}"
+        run: |
+          keychain="$RUNNER_TEMP/arty-smoke.keychain-db"
+          password="$(openssl rand -hex 32)"
+          security create-keychain -p "$password" "$keychain"
+          trap 'security delete-keychain "$keychain"' EXIT
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          ARTY_CREDENTIAL_SMOKE_VALUE="ci-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "ci-${{ matrix.target }}"
       - name: Record standalone comparison
         shell: bash
         run: bun bench/measure-help.ts "$RUNNER_TEMP/arty" "$RUNNER_TEMP/arty-help-baseline" >> "$GITHUB_STEP_SUMMARY"
