@@ -1,6 +1,12 @@
+export interface PublishFile {
+  readonly content: Uint8Array;
+  readonly contentType: string;
+  readonly path: string;
+}
+
 export interface PublishRequest {
   readonly artifactId: string;
-  readonly content: Uint8Array;
+  readonly files: ReadonlyArray<PublishFile>;
 }
 
 export interface DeleteRequest {
@@ -67,7 +73,7 @@ export const createLocalWorkerProvider = (
       );
     }
   },
-  publish: async ({ artifactId, content }) => {
+  publish: async ({ artifactId, files }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
       throw new ProviderError(
         "ARTY_WORKER_URL and ARTY_MANAGEMENT_SECRET are required to publish.",
@@ -76,10 +82,16 @@ export const createLocalWorkerProvider = (
 
     const baseUrl = workerUrl.replace(/\/$/, "");
     const response = await request(`${baseUrl}/_arty/artifacts/${artifactId}`, {
-      body: Uint8Array.from(content).buffer,
+      body: JSON.stringify({
+        files: files.map((file) => ({
+          content: Buffer.from(file.content).toString("base64"),
+          contentType: file.contentType,
+          path: file.path,
+        })),
+      }),
       headers: {
         authorization: `Bearer ${managementSecret}`,
-        "content-type": "text/html; charset=utf-8",
+        "content-type": "application/json",
       },
       method: "PUT",
     });

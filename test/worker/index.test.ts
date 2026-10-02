@@ -40,7 +40,7 @@ class MemoryR2 {
 }
 
 describe("Worker HTTP interface", () => {
-  test("commits and serves one HTML Artifact", async () => {
+  test("commits and serves only files declared by a directory Artifact", async () => {
     const bucket = new MemoryR2();
     const environment: WorkerEnvironment = {
       ARTIFACTS: bucket,
@@ -50,7 +50,22 @@ describe("Worker HTTP interface", () => {
 
     const publishResponse = await worker.fetch(
       new Request(`https://arty.test/_arty/artifacts/${artifactId}`, {
-        body: "<h1>Hello from Arty</h1>",
+        body: JSON.stringify({
+          files: [
+            {
+              content: Buffer.from("body {}\n").toString("base64"),
+              contentType: "text/css; charset=utf-8",
+              path: "assets/app.css",
+            },
+            {
+              content: Buffer.from("<h1>Hello from Arty</h1>").toString(
+                "base64",
+              ),
+              contentType: "text/html; charset=utf-8",
+              path: "index.html",
+            },
+          ],
+        }),
         headers: {
           authorization: "Bearer local-secret",
           "content-type": "text/html; charset=utf-8",
@@ -70,6 +85,24 @@ describe("Worker HTTP interface", () => {
       "text/html; charset=utf-8",
     );
     expect(await viewerResponse.text()).toBe("<h1>Hello from Arty</h1>");
+
+    const assetResponse = await worker.fetch(
+      new Request(`https://arty.test/${artifactId}/assets/app.css`),
+      environment,
+    );
+    expect(assetResponse.status).toBe(200);
+    expect(assetResponse.headers.get("content-type")).toBe(
+      "text/css; charset=utf-8",
+    );
+    expect(await assetResponse.text()).toBe("body {}\n");
+    expect(
+      (
+        await worker.fetch(
+          new Request(`https://arty.test/${artifactId}/missing.css`),
+          environment,
+        )
+      ).status,
+    ).toBe(404);
   });
 
   test("rejects unauthenticated and browser management requests", async () => {
@@ -110,7 +143,15 @@ describe("Worker HTTP interface", () => {
     const publish = (body: string) =>
       worker.fetch(
         new Request(url, {
-          body,
+          body: JSON.stringify({
+            files: [
+              {
+                content: Buffer.from(body).toString("base64"),
+                contentType: "text/html; charset=utf-8",
+                path: "index.html",
+              },
+            ],
+          }),
           headers: { authorization: "Bearer local-secret" },
           method: "PUT",
         }),
@@ -136,7 +177,15 @@ describe("Worker HTTP interface", () => {
     const managementUrl = `https://arty.test/_arty/artifacts/${artifactId}`;
     await worker.fetch(
       new Request(managementUrl, {
-        body: "artifact",
+        body: JSON.stringify({
+          files: [
+            {
+              content: Buffer.from("artifact").toString("base64"),
+              contentType: "text/html; charset=utf-8",
+              path: "index.html",
+            },
+          ],
+        }),
         headers: { authorization: "Bearer local-secret" },
         method: "PUT",
       }),
