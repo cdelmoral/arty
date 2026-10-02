@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "integration/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run build
+      - name: Run standalone executable outside the build tree
+        run: |
+          cp dist/arty "$RUNNER_TEMP/arty"
+          cd "$RUNNER_TEMP"
+          env -u BUN_INSTALL PATH=/usr/bin:/bin ./arty --version
+
+  native-credential-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: macos-15
+            target: darwin-arm64
+    name: Native credential smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run build:baseline
+      - name: Move executables outside the build tree
+        shell: bash
+        run: |
+          mv dist/arty "$RUNNER_TEMP/arty"
+          mv dist/arty-help-baseline "$RUNNER_TEMP/arty-help-baseline"
+      - name: Give the macOS executable a stable CI identity
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - --identifier dev.arty.cli "$RUNNER_TEMP/arty"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/arty"
+      - name: Install Linux Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes dbus-x11 gnome-keyring
+      - name: Smoke test Linux Secret Service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The nested shell expands runner variables inside the single-quoted script.
+          # shellcheck disable=SC2016
+          dbus-run-session -- bash -euo pipefail -c '
+            export HOME="$RUNNER_TEMP/keyring-home"
+            export XDG_DATA_HOME="$HOME/.local/share"
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/keyring-runtime"
+            export GNOME_KEYRING_CONTROL="$XDG_RUNTIME_DIR/keyring"
+            mkdir -p -m 700 "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+            eval "$(printf "%s" "ci-keyring-password" | gnome-keyring-daemon --login --components=secrets --control-directory="$GNOME_KEYRING_CONTROL")"
+            eval "$(gnome-keyring-daemon --start --components=secrets)"
+            ARTY_CREDENTIAL_SMOKE_VALUE="ci-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "ci-${{ matrix.target }}"
+          '
+      - name: Smoke test macOS Keychain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          keychain="$RUNNER_TEMP/arty-smoke.keychain-db"
+          security create-keychain -p "" "$keychain"
+          trap 'security delete-keychain "$keychain"' EXIT
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          ARTY_CREDENTIAL_SMOKE_VALUE="ci-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "ci-${{ matrix.target }}"
+      - name: Record standalone comparison
+        shell: bash
+        run: bun bench/measure-help.ts "$RUNNER_TEMP/arty" "$RUNNER_TEMP/arty-help-baseline" >> "$GITHUB_STEP_SUMMARY"

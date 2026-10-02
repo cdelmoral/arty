@@ -1,0 +1,32 @@
+{
+  "name": "arty",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "arty": "./src/cli/main.ts"
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "build:baseline": "bun build --compile --minify --outfile dist/arty-help-baseline bench/help-baseline.ts",
+    "check": "bun run format:check && bun run typecheck && bun test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "formula": "bun run scripts/homebrew-formula.ts",
+    "smoke:cloudflare": "bash scripts/cloudflare-release-smoke.sh",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "verify:archive": "bun run scripts/verify-release-archive.ts"
+  },
+  "dependencies": {
+    "@napi-rs/keyring": "2.1.0",
+    "commander": "15.0.0",
+    "effect": "4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "bun@1.4.2"
+}

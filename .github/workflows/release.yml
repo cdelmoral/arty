@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to verify without publishing
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-artifact:
+    name: Native artifact (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: macos-15
+            target: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Match the release tag to the package version
+        run: test "${RELEASE_TAG#v}" = "$(bun -p "require('./package.json').version")"
+      - run: bun run check
+      - run: bun run build
+      - name: Install Linux Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes dbus-x11 gnome-keyring
+      - name: Import Apple signing identity
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/arty.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/arty.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/arty.keychain-db"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/arty.keychain-db"
+          security list-keychain -d user -s "$RUNNER_TEMP/arty.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/arty.keychain-db"
+      - name: Sign macOS executable
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/arty
+          codesign --verify --strict --verbose=2 dist/arty
+      - name: Notarize macOS executable
+        if: runner.os == 'macOS'
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          test -n "$APPLE_NOTARY_KEY"
+          printf '%s' "$APPLE_NOTARY_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent dist/arty "$RUNNER_TEMP/arty-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/arty-notary.zip" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+      - name: Move executable outside the build tree
+        run: mv dist/arty "$RUNNER_TEMP/arty"
+      - name: Smoke test Linux Secret Service
+        if: runner.os == 'Linux'
+        run: |
+          # The nested shell expands runner variables inside the single-quoted script.
+          # shellcheck disable=SC2016
+          dbus-run-session -- bash -euo pipefail -c '
+            export HOME="$RUNNER_TEMP/keyring-home"
+            export XDG_DATA_HOME="$HOME/.local/share"
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/keyring-runtime"
+            export GNOME_KEYRING_CONTROL="$XDG_RUNTIME_DIR/keyring"
+            mkdir -p -m 700 "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+            eval "$(printf "%s" "release-keyring-password" | gnome-keyring-daemon --login --components=secrets --control-directory="$GNOME_KEYRING_CONTROL")"
+            eval "$(gnome-keyring-daemon --start --components=secrets)"
+            ARTY_CREDENTIAL_SMOKE_VALUE="release-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "release-${{ matrix.target }}"
+          '
+      - name: Smoke test macOS Keychain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/arty"
+          keychain="$RUNNER_TEMP/arty-smoke.keychain-db"
+          security create-keychain -p "" "$keychain"
+          trap 'security delete-keychain "$keychain"' EXIT
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          ARTY_CREDENTIAL_SMOKE_VALUE="release-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "release-${{ matrix.target }}"
+      - name: Package and verify archive
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="$GITHUB_WORKSPACE/arty-v${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "$RUNNER_TEMP" arty
+          bun run verify:archive "$archive" "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arty-${{ matrix.target }}
+          path: arty-*.tar.gz
+          if-no-files-found: error
+
+  assemble:
+    needs: native-artifact
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: arty-*
+          path: release
+          merge-multiple: true
+      - id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Create and verify checksums
+        working-directory: release
+        run: |
+          sha256sum arty-*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release/*
+          if-no-files-found: error
+
+  live-cloudflare:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    environment: release-cloudflare
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - run: cd release && sha256sum --check SHA256SUMS
+      - run: tar -xzf "release/arty-v${{ needs.assemble.outputs.version }}-linux-x64.tar.gz" -C "$RUNNER_TEMP"
+      - run: sudo apt-get update && sudo apt-get install --yes dbus-x11 gnome-keyring
+      - name: Run protected Cloudflare lifecycle
+        env:
+          ARTY_EXECUTABLE: ${{ runner.temp }}/arty
+        run: |
+          # The nested shell expands runner variables inside the single-quoted script.
+          # shellcheck disable=SC2016
+          dbus-run-session -- bash -euo pipefail -c '
+            export HOME="$RUNNER_TEMP/keyring-home"
+            export XDG_DATA_HOME="$HOME/.local/share"
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/keyring-runtime"
+            export XDG_CONFIG_HOME="$RUNNER_TEMP/config"
+            export GNOME_KEYRING_CONTROL="$XDG_RUNTIME_DIR/keyring"
+            mkdir -p -m 700 "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+            eval "$(printf "%s" "release-keyring-password" | gnome-keyring-daemon --login --components=secrets --control-directory="$GNOME_KEYRING_CONTROL")"
+            eval "$(gnome-keyring-daemon --start --components=secrets)"
+            bun run smoke:cloudflare
+          '
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [assemble, live-cloudflare]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  homebrew:
+    if: github.event_name == 'push'
+    needs: [assemble, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - uses: actions/checkout@v4
+        with:
+          repository: cdelmoral/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update formula
+        run: |
+          checksum() { grep "arty-v${{ needs.assemble.outputs.version }}-$1.tar.gz" release/SHA256SUMS | cut -d ' ' -f 1; }
+          mkdir -p homebrew-tap/Formula
+          bun run formula "${{ needs.assemble.outputs.version }}" "$(checksum darwin-arm64)" "$(checksum darwin-x64)" "$(checksum linux-arm64)" "$(checksum linux-x64)" > homebrew-tap/Formula/arty.rb
+          cd homebrew-tap
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/arty.rb
+          git commit -m "arty ${{ needs.assemble.outputs.version }}"
+          git push
