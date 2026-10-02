@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  truncate,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -64,10 +72,7 @@ describe("CLI application", () => {
     temporaryDirectories.push(sourceDirectory);
     const sourcePath = join(sourceDirectory, "prototype.html");
     await Bun.write(sourcePath, "<h1>Hello from Arty</h1>");
-    const requests: Array<{
-      artifactId: string;
-      content: Uint8Array;
-    }> = [];
+    const requests: Array<Parameters<Provider["publish"]>[0]> = [];
     const provider: Provider = {
       publish: async (request) => {
         requests.push(request);
@@ -91,7 +96,8 @@ describe("CLI application", () => {
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.artifactId).toBe("________________________________");
-    expect(new TextDecoder().decode(requests[0]?.content)).toBe(
+    expect(requests[0]?.files[0]?.path).toBe("index.html");
+    expect(new TextDecoder().decode(requests[0]?.files[0]?.content)).toBe(
       "<h1>Hello from Arty</h1>",
     );
   });
@@ -119,23 +125,153 @@ describe("CLI application", () => {
     expect(providerCalls).toBe(0);
   });
 
-  test("rejects a directory before calling the Provider", async () => {
-    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site.html-"));
+  test("rejects more than 5,000 files before transfer", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
     temporaryDirectories.push(sourceDirectory);
+    const indexPath = join(sourceDirectory, "index.html");
+    await Bun.write(indexPath, "site");
+    for (let index = 0; index < 5_000; index += 1) {
+      await link(indexPath, join(sourceDirectory, `${index}.txt`));
+    }
     let providerCalls = 0;
+
+    const result = await invoke(
+      ["publish", sourceDirectory],
+      {},
+      {
+        provider: {
+          publish: async () => {
+            providerCalls += 1;
+            return "https://arty.example/unexpected/";
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("5,000 files");
+    expect(providerCalls).toBe(0);
+  });
+
+  test("publishes every eligible file in a directory Source", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
+    temporaryDirectories.push(sourceDirectory);
+    await mkdir(join(sourceDirectory, "assets"));
+    await mkdir(join(sourceDirectory, ".git"));
+    await Bun.write(join(sourceDirectory, "index.html"), "<h1>Site</h1>");
+    await Bun.write(join(sourceDirectory, "assets", "app.css"), "body {}\n");
+    await Bun.write(
+      join(sourceDirectory, "assets", "data.bin"),
+      new Uint8Array([0, 255]),
+    );
+    await Bun.write(join(sourceDirectory, ".git", "config"), "secret");
+    await Bun.write(join(sourceDirectory, ".env"), "secret");
+    const requests: Array<Parameters<Provider["publish"]>[0]> = [];
     const provider: Provider = {
-      publish: async () => {
-        providerCalls += 1;
-        return "https://arty.example/unexpected/";
+      publish: async (request) => {
+        requests.push(request);
+        return `https://arty.example/${request.artifactId}/`;
       },
     };
 
     const result = await invoke(["publish", sourceDirectory], {}, { provider });
 
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(providerCalls).toBe(0);
+    expect(result.exitCode).toBe(0);
+    expect(
+      requests[0]?.files.map(({ path, contentType, content }) => ({
+        path,
+        contentType,
+        content: [...content],
+      })),
+    ).toEqual([
+      {
+        path: "assets/app.css",
+        contentType: "text/css; charset=utf-8",
+        content: [...new TextEncoder().encode("body {}\n")],
+      },
+      {
+        path: "assets/data.bin",
+        contentType: "application/octet-stream",
+        content: [0, 255],
+      },
+      {
+        path: "index.html",
+        contentType: "text/html; charset=utf-8",
+        content: [...new TextEncoder().encode("<h1>Site</h1>")],
+      },
+    ]);
   });
+
+  test.each([
+    [
+      "missing root index",
+      async (path: string) => Bun.write(join(path, "page.html"), "page"),
+      "root index.html",
+    ],
+    [
+      "a symlink",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        await symlink("index.html", join(path, "copy.html"));
+      },
+      "symbolic link",
+    ],
+    [
+      "an unsupported entry",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        const process = Bun.spawn(["mkfifo", join(path, "updates")]);
+        expect(await process.exited).toBe(0);
+      },
+      "unsupported entry",
+    ],
+    [
+      "an oversized file",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        await Bun.write(join(path, "large.bin"), "");
+        await truncate(join(path, "large.bin"), 25 * 1024 * 1024 + 1);
+      },
+      "25 MiB",
+    ],
+    [
+      "an oversized total",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        for (let index = 0; index < 5; index += 1) {
+          await Bun.write(join(path, `${index}.bin`), "");
+          await truncate(join(path, `${index}.bin`), 21 * 1024 * 1024);
+        }
+      },
+      "100 MiB",
+    ],
+  ])(
+    "rejects a directory Source containing %s before transfer",
+    async (_name, arrange, message) => {
+      const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
+      temporaryDirectories.push(sourceDirectory);
+      await arrange(sourceDirectory);
+      let providerCalls = 0;
+
+      const result = await invoke(
+        ["publish", sourceDirectory],
+        {},
+        {
+          provider: {
+            publish: async () => {
+              providerCalls += 1;
+              return "https://arty.example/unexpected/";
+            },
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(result.stdout).toBe("");
+      expect(providerCalls).toBe(0);
+    },
+  );
 
   test("prints stable help to stdout", async () => {
     expect(await invoke(["--help"])).toEqual({
