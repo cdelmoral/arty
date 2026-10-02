@@ -1096,7 +1096,7 @@ describe("CLI application", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe(
-      "error: The operating system credential store is unavailable.\n",
+      "error: Credential smoke set failed: native failure contained <redacted>\n",
     );
     expect(result.stderr).not.toContain("do-not-print-me");
   });
