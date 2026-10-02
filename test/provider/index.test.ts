@@ -65,7 +65,13 @@ describe("configured Cloudflare Provider", () => {
     const accessUrl = await createConfiguredCloudflareProvider(runtime).publish(
       {
         artifactId: "________________________________",
-        content: new TextEncoder().encode("<h1>Remote</h1>"),
+        files: [
+          {
+            content: new TextEncoder().encode("<h1>Remote</h1>"),
+            contentType: "text/html; charset=utf-8",
+            path: "index.html",
+          },
+        ],
       },
     );
 

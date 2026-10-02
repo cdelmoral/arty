@@ -1,20 +1,36 @@
+import { managementSecretAccount } from "../cloudflare";
 import type { ConfigEnvironment } from "../config";
 import { getCloudflareConfig } from "../config";
-import { managementSecretAccount } from "../cloudflare";
 import type { CredentialStore } from "../credentials";
 import { resolveCredential } from "../credentials";
 
+export interface PublishFile {
+  readonly content: Uint8Array;
+  readonly contentType: string;
+  readonly path: string;
+}
+
 export interface PublishRequest {
   readonly artifactId: string;
-  readonly content: Uint8Array;
+  readonly files: ReadonlyArray<PublishFile>;
+}
+
+export interface DeleteRequest {
+  readonly artifactId: string;
+  readonly operationId: string;
 }
 
 export interface Provider {
+  readonly delete: (request: DeleteRequest) => Promise<void>;
   readonly publish: (request: PublishRequest) => Promise<string>;
 }
 
 export class ProviderError extends Error {
-  readonly name = "ProviderError";
+  readonly name: string = "ProviderError";
+}
+
+export class ProviderNotFoundError extends ProviderError {
+  readonly name = "ProviderNotFoundError";
 }
 
 type ProviderFetch = (
@@ -22,12 +38,53 @@ type ProviderFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+const retryableStatus = (status: number): boolean =>
+  status === 429 || [500, 502, 503, 504].includes(status);
+
 export const createLocalWorkerProvider = (
   workerUrl: string | undefined,
   managementSecret: string | undefined,
-  fetchImplementation: ProviderFetch = fetch,
+  request: ProviderFetch = fetch,
 ): Provider => ({
-  publish: async ({ artifactId, content }) => {
+  delete: async ({ artifactId, operationId }) => {
+    if (workerUrl === undefined || managementSecret === undefined) {
+      throw new ProviderError(
+        "ARTY_WORKER_URL and ARTY_MANAGEMENT_SECRET are required to delete an Artifact.",
+      );
+    }
+
+    const baseUrl = workerUrl.replace(/\/$/, "");
+    let response: Response | undefined;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        response = await request(`${baseUrl}/_arty/artifacts/${artifactId}`, {
+          headers: {
+            authorization: `Bearer ${managementSecret}`,
+            "x-arty-operation-id": operationId,
+          },
+          method: "DELETE",
+        });
+      } catch (error) {
+        if (attempt === 2) {
+          throw new ProviderError("Provider deletion request failed.", {
+            cause: error,
+          });
+        }
+        continue;
+      }
+      if (!retryableStatus(response.status) || attempt === 2) break;
+    }
+
+    if (response?.status === 404) {
+      throw new ProviderNotFoundError("Artifact was not found.");
+    }
+    if (response === undefined || !response.ok) {
+      throw new ProviderError(
+        `Provider rejected deletion (${response?.status ?? "network error"}).`,
+      );
+    }
+  },
+  publish: async ({ artifactId, files }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
       throw new ProviderError(
         "ARTY_WORKER_URL and ARTY_MANAGEMENT_SECRET are required to publish.",
@@ -35,17 +92,20 @@ export const createLocalWorkerProvider = (
     }
 
     const baseUrl = workerUrl.replace(/\/$/, "");
-    const response = await fetchImplementation(
-      `${baseUrl}/_arty/artifacts/${artifactId}`,
-      {
-        body: Uint8Array.from(content).buffer,
-        headers: {
-          authorization: `Bearer ${managementSecret}`,
-          "content-type": "text/html; charset=utf-8",
-        },
-        method: "PUT",
+    const response = await request(`${baseUrl}/_arty/artifacts/${artifactId}`, {
+      body: JSON.stringify({
+        files: files.map((file) => ({
+          content: Buffer.from(file.content).toString("base64"),
+          contentType: file.contentType,
+          path: file.path,
+        })),
+      }),
+      headers: {
+        authorization: `Bearer ${managementSecret}`,
+        "content-type": "application/json",
       },
-    );
+      method: "PUT",
+    });
     if (!response.ok) {
       throw new ProviderError(
         `Provider rejected publication (${response.status}).`,
@@ -62,8 +122,8 @@ export const createConfiguredCloudflareProvider = (
     readonly environment: Readonly<Record<string, string | undefined>>;
     readonly fetch?: ProviderFetch;
   },
-): Provider => ({
-  publish: async (request) => {
+): Provider => {
+  const configuredProvider = async (): Promise<Provider> => {
     const config = await getCloudflareConfig(runtime);
     if (config === undefined) {
       throw new ProviderError("Run `arty init cloudflare` before publishing.");
@@ -77,6 +137,11 @@ export const createConfiguredCloudflareProvider = (
       config.workerUrl,
       managementSecret,
       runtime.fetch,
-    ).publish(request);
-  },
-});
+    );
+  };
+
+  return {
+    delete: async (request) => (await configuredProvider()).delete(request),
+    publish: async (request) => (await configuredProvider()).publish(request),
+  };
+};

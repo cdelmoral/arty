@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  truncate,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +17,11 @@ import type {
   CloudflareProvisioner,
 } from "../../src/cloudflare";
 import type { CredentialStore } from "../../src/credentials";
-import type { Provider } from "../../src/provider";
+import {
+  createLocalWorkerProvider,
+  ProviderNotFoundError,
+  type Provider,
+} from "../../src/provider";
 
 const temporaryDirectories: Array<string> = [];
 const unusedCredentialStore: CredentialStore = {
@@ -18,6 +30,9 @@ const unusedCredentialStore: CredentialStore = {
   set: async () => {},
 };
 const unusedProvider: Provider = {
+  delete: async () => {
+    throw new Error("Provider should not be called");
+  },
   publish: async () => {
     throw new Error("Provider should not be called");
   },
@@ -82,11 +97,9 @@ describe("CLI application", () => {
     temporaryDirectories.push(sourceDirectory);
     const sourcePath = join(sourceDirectory, "prototype.html");
     await Bun.write(sourcePath, "<h1>Hello from Arty</h1>");
-    const requests: Array<{
-      artifactId: string;
-      content: Uint8Array;
-    }> = [];
+    const requests: Array<Parameters<Provider["publish"]>[0]> = [];
     const provider: Provider = {
+      delete: unusedProvider.delete,
       publish: async (request) => {
         requests.push(request);
         return `https://arty.example/${request.artifactId}/`;
@@ -109,7 +122,8 @@ describe("CLI application", () => {
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.artifactId).toBe("________________________________");
-    expect(new TextDecoder().decode(requests[0]?.content)).toBe(
+    expect(requests[0]?.files[0]?.path).toBe("index.html");
+    expect(new TextDecoder().decode(requests[0]?.files[0]?.content)).toBe(
       "<h1>Hello from Arty</h1>",
     );
   });
@@ -124,6 +138,7 @@ describe("CLI application", () => {
   ])("rejects %s before calling the Provider", async (_name, argv) => {
     let providerCalls = 0;
     const provider: Provider = {
+      delete: unusedProvider.delete,
       publish: async () => {
         providerCalls += 1;
         return "https://arty.example/unexpected/";
@@ -137,30 +152,285 @@ describe("CLI application", () => {
     expect(providerCalls).toBe(0);
   });
 
-  test("rejects a directory before calling the Provider", async () => {
-    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site.html-"));
-    temporaryDirectories.push(sourceDirectory);
-    let providerCalls = 0;
+  test("reports an unknown or already deleted Artifact as not found", async () => {
     const provider: Provider = {
-      publish: async () => {
-        providerCalls += 1;
-        return "https://arty.example/unexpected/";
+      delete: async () => {
+        throw new ProviderNotFoundError("Artifact was not found.");
+      },
+      publish: unusedProvider.publish,
+    };
+
+    const result = await invoke(
+      ["delete", "________________________________"],
+      {},
+      { provider },
+    );
+
+    expect(result).toEqual({
+      exitCode: 1,
+      stderr: "error: Artifact was not found.\n",
+      stdout: "",
+    });
+  });
+
+  test("retries transient deletion responses without exposing credentials", async () => {
+    const secret = "do-not-print-me";
+    const requests: Array<{ input: string; init: RequestInit | undefined }> =
+      [];
+    const request = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      requests.push({ input: String(input), init });
+      return new Response(null, { status: requests.length < 3 ? 503 : 204 });
+    }) as typeof fetch;
+    const provider = createLocalWorkerProvider(
+      "https://arty.example/",
+      secret,
+      request,
+    );
+
+    const result = await invoke(
+      ["delete", "________________________________"],
+      {},
+      {
+        provider,
+        randomBytes: () => new Uint8Array(24).fill(255),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(requests).toHaveLength(3);
+    expect(requests.map(({ input }) => input)).toEqual(
+      Array(3).fill(`https://arty.example/_arty/artifacts/${"_".repeat(32)}`),
+    );
+    expect(
+      requests.map(({ init }) =>
+        new Headers(init?.headers).get("authorization"),
+      ),
+    ).toEqual(Array(3).fill(`Bearer ${secret}`));
+    expect(
+      requests.map(({ init }) =>
+        new Headers(init?.headers).get("x-arty-operation-id"),
+      ),
+    ).toEqual(Array(3).fill("_".repeat(32)));
+    expect(result.stdout + result.stderr).not.toContain(secret);
+  });
+
+  test("rejects more than 5,000 files before transfer", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
+    temporaryDirectories.push(sourceDirectory);
+    const indexPath = join(sourceDirectory, "index.html");
+    await Bun.write(indexPath, "site");
+    for (let index = 0; index < 5_000; index += 1) {
+      await link(indexPath, join(sourceDirectory, `${index}.txt`));
+    }
+    let providerCalls = 0;
+
+    const result = await invoke(
+      ["publish", sourceDirectory],
+      {},
+      {
+        provider: {
+          delete: unusedProvider.delete,
+          publish: async () => {
+            providerCalls += 1;
+            return "https://arty.example/unexpected/";
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("5,000 files");
+    expect(providerCalls).toBe(0);
+  });
+
+  test("publishes every eligible file in a directory Source", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
+    temporaryDirectories.push(sourceDirectory);
+    await mkdir(join(sourceDirectory, "assets"));
+    await mkdir(join(sourceDirectory, ".git"));
+    await Bun.write(join(sourceDirectory, "index.html"), "<h1>Site</h1>");
+    await Bun.write(join(sourceDirectory, "assets", "app.css"), "body {}\n");
+    await Bun.write(
+      join(sourceDirectory, "assets", "data.bin"),
+      new Uint8Array([0, 255]),
+    );
+    await Bun.write(join(sourceDirectory, ".git", "config"), "secret");
+    await Bun.write(join(sourceDirectory, ".env"), "secret");
+    const requests: Array<Parameters<Provider["publish"]>[0]> = [];
+    const provider: Provider = {
+      delete: unusedProvider.delete,
+      publish: async (request) => {
+        requests.push(request);
+        return `https://arty.example/${request.artifactId}/`;
       },
     };
 
     const result = await invoke(["publish", sourceDirectory], {}, { provider });
 
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(providerCalls).toBe(0);
+    expect(result.exitCode).toBe(0);
+    expect(
+      requests[0]?.files.map(({ path, contentType, content }) => ({
+        path,
+        contentType,
+        content: [...content],
+      })),
+    ).toEqual([
+      {
+        path: "assets/app.css",
+        contentType: "text/css; charset=utf-8",
+        content: [...new TextEncoder().encode("body {}\n")],
+      },
+      {
+        path: "assets/data.bin",
+        contentType: "application/octet-stream",
+        content: [0, 255],
+      },
+      {
+        path: "index.html",
+        contentType: "text/html; charset=utf-8",
+        content: [...new TextEncoder().encode("<h1>Site</h1>")],
+      },
+    ]);
   });
+
+  test.each([
+    [
+      "missing root index",
+      async (path: string) => Bun.write(join(path, "page.html"), "page"),
+      "root index.html",
+    ],
+    [
+      "a symlink",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        await symlink("index.html", join(path, "copy.html"));
+      },
+      "symbolic link",
+    ],
+    [
+      "an unsupported entry",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        const process = Bun.spawn(["mkfifo", join(path, "updates")]);
+        expect(await process.exited).toBe(0);
+      },
+      "unsupported entry",
+    ],
+    [
+      "an oversized file",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        await Bun.write(join(path, "large.bin"), "");
+        await truncate(join(path, "large.bin"), 25 * 1024 * 1024 + 1);
+      },
+      "25 MiB",
+    ],
+    [
+      "an oversized total",
+      async (path: string) => {
+        await Bun.write(join(path, "index.html"), "site");
+        for (let index = 0; index < 5; index += 1) {
+          await Bun.write(join(path, `${index}.bin`), "");
+          await truncate(join(path, `${index}.bin`), 21 * 1024 * 1024);
+        }
+      },
+      "100 MiB",
+    ],
+  ])(
+    "rejects a directory Source containing %s before transfer",
+    async (_name, arrange, message) => {
+      const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-site-"));
+      temporaryDirectories.push(sourceDirectory);
+      await arrange(sourceDirectory);
+      let providerCalls = 0;
+
+      const result = await invoke(
+        ["publish", sourceDirectory],
+        {},
+        {
+          provider: {
+            delete: unusedProvider.delete,
+            publish: async () => {
+              providerCalls += 1;
+              return "https://arty.example/unexpected/";
+            },
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(result.stdout).toBe("");
+      expect(providerCalls).toBe(0);
+    },
+  );
 
   test("prints stable help to stdout", async () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  config                     Manage Arty settings.\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
     });
+  });
+
+  test.each([
+    ["Artifact ID", "________________________________"],
+    ["Access URL", "https://arty.example/________________________________/"],
+  ])("deletes an Artifact by %s", async (_name, target) => {
+    const requests: Array<{ artifactId: string; operationId: string }> = [];
+    const provider: Provider = {
+      delete: async (request) => {
+        requests.push(request);
+      },
+      publish: unusedProvider.publish,
+    };
+
+    const result = await invoke(
+      ["delete", target],
+      {},
+      {
+        provider,
+        randomBytes: () => new Uint8Array(24).fill(255),
+      },
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stderr: `Deleted Artifact ${"_".repeat(32)}.\n`,
+      stdout: "",
+    });
+    expect(requests).toEqual([
+      {
+        artifactId: "________________________________",
+        operationId: "________________________________",
+      },
+    ]);
+    expect(result.stderr).not.toContain("https://arty.example");
+  });
+
+  test.each([
+    "short",
+    "https://arty.example/not-an-artifact/",
+    "https://arty.example/________________________________/extra",
+    "ftp://arty.example/________________________________/",
+  ])("rejects malformed deletion target %s", async (target) => {
+    let providerCalls = 0;
+    const provider: Provider = {
+      delete: async () => {
+        providerCalls += 1;
+      },
+      publish: unusedProvider.publish,
+    };
+
+    const result = await invoke(["delete", target], {}, { provider });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("error: Invalid Artifact ID or Access URL.\n");
+    expect(providerCalls).toBe(0);
   });
 
   test("prints only the version to stdout", async () => {
