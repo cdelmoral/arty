@@ -75,11 +75,10 @@ jobs:
         shell: bash
         run: |
           keychain="$RUNNER_TEMP/arty-smoke.keychain-db"
-          password="$(openssl rand -hex 32)"
-          security create-keychain -p "$password" "$keychain"
+          security create-keychain -p "" "$keychain"
           trap 'security delete-keychain "$keychain"' EXIT
           security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
+          security unlock-keychain -p "" "$keychain"
           security list-keychains -d user -s "$keychain"
           security default-keychain -d user -s "$keychain"
           ARTY_CREDENTIAL_SMOKE_VALUE="ci-credential-value" "$RUNNER_TEMP/arty" _credential-smoke-test "ci-${{ matrix.target }}"
