@@ -4,6 +4,7 @@ import worker, { type WorkerEnvironment } from "../../worker";
 
 class MemoryR2 {
   readonly objects = new Map<string, Uint8Array>();
+  failFileDeletion = false;
 
   async get(key: string) {
     const value = this.objects.get(key);
@@ -28,6 +29,13 @@ class MemoryR2 {
           : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     this.objects.set(key, bytes.slice());
     return { etag: "test-etag" };
+  }
+
+  async delete(key: string) {
+    if (this.failFileDeletion && key.startsWith("staging/")) {
+      throw new Error("physical cleanup failed");
+    }
+    this.objects.delete(key);
   }
 }
 
@@ -246,5 +254,50 @@ describe("Worker HTTP interface", () => {
       status: expiredPost.status,
       body: await expiredPost.text(),
     }).toEqual({ status: unknown.status, body: "Not found" });
+  });
+
+  test("deletes the manifest before physical cleanup and makes retries idempotent", async () => {
+    const bucket = new MemoryR2();
+    const environment: WorkerEnvironment = {
+      ARTIFACTS: bucket,
+      MANAGEMENT_SECRET: "local-secret",
+    };
+    const artifactId = "________________________________";
+    const managementUrl = `https://arty.test/_arty/artifacts/${artifactId}`;
+    await worker.fetch(
+      new Request(managementUrl, {
+        body: "artifact",
+        headers: {
+          authorization: "Bearer local-secret",
+          "x-arty-lifetime-ms": "60000",
+        },
+        method: "PUT",
+      }),
+      environment,
+    );
+    bucket.failFileDeletion = true;
+    const remove = (operationId: string) =>
+      worker.fetch(
+        new Request(managementUrl, {
+          headers: {
+            authorization: "Bearer local-secret",
+            "x-arty-operation-id": operationId,
+          },
+          method: "DELETE",
+        }),
+        environment,
+      );
+
+    expect((await remove("________________________________")).status).toBe(204);
+    expect(
+      (
+        await worker.fetch(
+          new Request(`https://arty.test/${artifactId}/`),
+          environment,
+        )
+      ).status,
+    ).toBe(404);
+    expect((await remove("________________________________")).status).toBe(204);
+    expect((await remove("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).status).toBe(404);
   });
 });

@@ -14,6 +14,7 @@ import {
   smokeTestCredentialStore,
   type CredentialStore,
 } from "../credentials";
+import { deleteArtifact, DeleteError } from "../delete";
 import { createLocalWorkerProvider, type Provider } from "../provider";
 import { publish, PublishError } from "../publish";
 
@@ -64,6 +65,17 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
     .argument("<path>")
     .action(async (path: string) => {
       await publishSource(path, program.opts<{ lifetime?: string }>().lifetime);
+    });
+
+  program
+    .command("delete")
+    .description("Delete an Artifact before expiry.")
+    .argument("<url-or-id>")
+    .action(async (target: string) => {
+      const artifactId = await Effect.runPromise(
+        deleteArtifact(target, runtime),
+      );
+      output.writeStderr(`Deleted Artifact ${artifactId}.\n`);
     });
 
   const config = program.command("config").description("Manage Arty settings.");
@@ -132,6 +144,7 @@ export const runCli = (
         if (
           error instanceof ConfigError ||
           error instanceof CredentialError ||
+          error instanceof DeleteError ||
           error instanceof PublishError
         ) {
           output.writeStderr(`error: ${error.message}\n`);
