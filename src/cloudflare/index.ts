@@ -34,9 +34,10 @@ export interface CloudflareProvisioner {
     accountId: string,
     token: string,
   ) => Promise<string | undefined>;
-  readonly provision: (
-    request: CloudflareProvisionRequest,
-  ) => Promise<{ readonly workerUrl: string }>;
+  readonly provision: (request: CloudflareProvisionRequest) => Promise<{
+    readonly warnings?: ReadonlyArray<string>;
+    readonly workerUrl: string;
+  }>;
 }
 
 export interface InitializeEnvironment extends ConfigEnvironment {
@@ -111,16 +112,49 @@ export const initializeCloudflare = async (
     subdomain = existingSubdomain;
   }
 
-  const secretBytes = runtime.randomBytes(32);
-  if (secretBytes.byteLength !== 32) {
-    throw new InitializationError("Could not generate a management secret.");
+  if (existingConfig?.accountId === accountId) {
+    const expectedWorkerUrl = `https://${options.workerName}.${subdomain}.workers.dev`;
+    if (
+      existingConfig.workerName !== options.workerName ||
+      existingConfig.bucketName !== options.bucketName
+    ) {
+      output.writeStderr(
+        "warning: The configured Worker or bucket name changed; existing Access URLs may no longer work.\n",
+      );
+    } else if (existingConfig.workerUrl !== expectedWorkerUrl) {
+      output.writeStderr(
+        "warning: The workers.dev production URL or account subdomain changed; existing Access URLs may no longer work. Arty will not rename the account subdomain.\n",
+      );
+    }
   }
-  const managementSecret = Buffer.from(secretBytes).toString("base64url");
+
+  let managementSecret = await runtime.credentialStore.get(
+    managementSecretAccount(accountId),
+  );
+  if (managementSecret === undefined) {
+    if (existingConfig?.accountId === accountId) {
+      output.writeStderr(
+        "The existing management secret is unavailable. Replacing it means another installation will stop working.\n",
+      );
+      if (
+        !(await runtime.initialization.confirm(
+          "Rotate the missing management secret and continue? ",
+        ))
+      ) {
+        throw new InitializationError("Initialization cancelled.");
+      }
+    }
+    const secretBytes = runtime.randomBytes(32);
+    if (secretBytes.byteLength !== 32) {
+      throw new InitializationError("Could not generate a management secret.");
+    }
+    managementSecret = Buffer.from(secretBytes).toString("base64url");
+  }
   const allowExisting =
     existingConfig?.accountId === accountId &&
     existingConfig.workerName === options.workerName &&
     existingConfig.bucketName === options.bucketName;
-  const { workerUrl } = await runtime.provisioner.provision({
+  const { warnings = [], workerUrl } = await runtime.provisioner.provision({
     accountId,
     allowExisting,
     bucketName: options.bucketName,
@@ -130,6 +164,7 @@ export const initializeCloudflare = async (
     token,
     workerName: options.workerName,
   });
+  for (const warning of warnings) output.writeStderr(`warning: ${warning}\n`);
 
   const config: CloudflareConfig = {
     accountId,
@@ -166,6 +201,7 @@ interface CloudflareEnvelope<T> {
 }
 
 const workerSource = `const ARTY_OWNER = "arty";
+const ARTY_PROTOCOL_VERSION = ${MANAGEMENT_PROTOCOL_VERSION};
 const cleanup = async (scheduledTime, env) => {
   let cursor;
   const manifestKeys = [];
@@ -261,6 +297,23 @@ export const createCloudflareProvisioner = (
     return true;
   };
 
+  const raw = async (
+    path: string,
+    token: string,
+  ): Promise<Response | undefined> => {
+    const response = await fetchImplementation(
+      `https://api.cloudflare.com/client/v4${path}`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    if (response.status === 404) return undefined;
+    if (!response.ok) {
+      throw new InitializationError(
+        `Cloudflare resource check failed (${response.status}).`,
+      );
+    }
+    return response;
+  };
+
   return {
     getWorkersSubdomain: async (accountId, token) => {
       const result = await request<{ readonly subdomain?: string }>(
@@ -273,21 +326,64 @@ export const createCloudflareProvisioner = (
       const accountPath = `/accounts/${encodeURIComponent(provisioning.accountId)}`;
       const workerPath = `${accountPath}/workers/scripts/${encodeURIComponent(provisioning.workerName)}`;
       const bucketPath = `${accountPath}/r2/buckets/${encodeURIComponent(provisioning.bucketName)}`;
-      const [workerExists, bucketExists] = await Promise.all([
-        exists(workerPath, provisioning.token),
+      const lifecyclePath = `${bucketPath}/lifecycle`;
+      const [workerResponse, bucketExists] = await Promise.all([
+        raw(workerPath, provisioning.token),
         exists(bucketPath, provisioning.token),
       ]);
-      if ((workerExists || bucketExists) && !provisioning.allowExisting) {
+      const workerText = await workerResponse?.text();
+      const workerOwned = workerText?.includes('ARTY_OWNER = "arty"') === true;
+      let bucketOwned = false;
+      if (bucketExists) {
+        const lifecycle = await raw(lifecyclePath, provisioning.token);
+        if (lifecycle !== undefined) {
+          const text = await lifecycle.text();
+          try {
+            const normalized = JSON.stringify(JSON.parse(text));
+            bucketOwned =
+              normalized.includes('"id":"arty-owner-v1-storage-backstop"') ||
+              (provisioning.allowExisting &&
+                normalized.includes('"id":"arty-storage-backstop"'));
+          } catch {
+            bucketOwned = false;
+          }
+        }
+      }
+      if (workerResponse !== undefined && !workerOwned) {
         throw new InitializationError(
-          "Cloudflare resource names already exist and Arty cannot prove it owns them. Choose alternate names.",
+          `Cloudflare Worker name "${provisioning.workerName}" conflicts with a resource Arty does not own.`,
+        );
+      }
+      if (bucketExists && !bucketOwned) {
+        throw new InitializationError(
+          `Cloudflare R2 bucket name "${provisioning.bucketName}" conflicts with a resource Arty does not own.`,
         );
       }
       if (!bucketExists) {
-        await request(`${accountPath}/r2/buckets`, provisioning.token, {
-          body: JSON.stringify({ name: provisioning.bucketName }),
-          method: "POST",
-        });
+        try {
+          await request(`${accountPath}/r2/buckets`, provisioning.token, {
+            body: JSON.stringify({ name: provisioning.bucketName }),
+            method: "POST",
+          });
+        } catch (error) {
+          if (!(await exists(bucketPath, provisioning.token))) throw error;
+        }
       }
+      await request(lifecyclePath, provisioning.token, {
+        body: JSON.stringify({
+          rules: [
+            {
+              conditions: { prefix: "" },
+              deleteObjectsTransition: {
+                condition: { maxAge: 35, type: "Age" },
+              },
+              enabled: true,
+              id: "arty-owner-v1-storage-backstop",
+            },
+          ],
+        }),
+        method: "PUT",
+      });
       if (provisioning.createSubdomain) {
         await request(`${accountPath}/workers/subdomain`, provisioning.token, {
           body: JSON.stringify({ subdomain: provisioning.subdomain }),
@@ -314,10 +410,20 @@ export const createCloudflareProvisioner = (
         new Blob([workerSource], { type: "application/javascript+module" }),
         "index.js",
       );
-      await request(workerPath, provisioning.token, {
-        body: form,
-        method: "PUT",
-      });
+      try {
+        await request(workerPath, provisioning.token, {
+          body: form,
+          method: "PUT",
+        });
+      } catch (error) {
+        const current = await raw(workerPath, provisioning.token);
+        if (
+          current === undefined ||
+          !(await current.text()).includes('ARTY_OWNER = "arty"')
+        ) {
+          throw error;
+        }
+      }
       await request(`${workerPath}/secrets`, provisioning.token, {
         body: JSON.stringify({
           name: "MANAGEMENT_SECRET",
@@ -338,22 +444,16 @@ export const createCloudflareProvisioner = (
         body: JSON.stringify({ cron: "0 0 * * *" }),
         method: "PUT",
       });
-      await request(`${bucketPath}/lifecycle`, provisioning.token, {
-        body: JSON.stringify({
-          rules: [
-            {
-              conditions: { prefix: "" },
-              deleteObjectsTransition: {
-                condition: { maxAge: 35, type: "Age" },
-              },
-              enabled: true,
-              id: "arty-storage-backstop",
-            },
-          ],
-        }),
-        method: "PUT",
-      });
+      const warnings =
+        provisioning.allowExisting &&
+        workerText !== undefined &&
+        !workerText.includes(
+          `ARTY_PROTOCOL_VERSION = ${MANAGEMENT_PROTOCOL_VERSION}`,
+        )
+          ? ["The Arty Worker was upgraded to the current management protocol."]
+          : [];
       return {
+        ...(warnings.length === 0 ? {} : { warnings }),
         workerUrl: `https://${provisioning.workerName}.${provisioning.subdomain}.workers.dev`,
       };
     },
