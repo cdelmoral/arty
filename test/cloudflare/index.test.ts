@@ -85,6 +85,27 @@ describe("Cloudflare provisioning interface", () => {
           request.url.endsWith("/r2/buckets/arty-content/lifecycle"),
       ),
     ).toBe(true);
+    const scheduleRequest = requests.find((request) =>
+      request.url.endsWith("/workers/scripts/arty/schedules"),
+    );
+    expect(scheduleRequest).toBeDefined();
+    expect(await scheduleRequest?.json()).toEqual({ cron: "0 0 * * *" });
+    const lifecycleRequest = requests.find((request) =>
+      request.url.endsWith("/r2/buckets/arty-content/lifecycle"),
+    );
+    expect(lifecycleRequest).toBeDefined();
+    expect(await lifecycleRequest?.json()).toEqual({
+      rules: [
+        {
+          conditions: { prefix: "" },
+          deleteObjectsTransition: {
+            condition: { maxAge: 35, type: "Age" },
+          },
+          enabled: true,
+          id: "arty-storage-backstop",
+        },
+      ],
+    });
   });
 
   test("refuses resource collisions that local configuration does not own", async () => {

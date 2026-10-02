@@ -5,8 +5,13 @@ interface R2ObjectBody {
 }
 
 interface R2BucketBinding {
-  delete(key: string): Promise<void>;
+  delete(key: string | ReadonlyArray<string>): Promise<void>;
   get(key: string): Promise<R2ObjectBody | null>;
+  list(options: { cursor?: string; limit: number; prefix: string }): Promise<{
+    readonly cursor?: string;
+    readonly objects: ReadonlyArray<{ readonly key: string }>;
+    readonly truncated: boolean;
+  }>;
   put(
     key: string,
     value: ArrayBuffer | ArrayBufferView | string,
@@ -40,6 +45,10 @@ const artifactIdPattern = /^[A-Za-z0-9_-]{32}$/;
 const managementPattern = /^\/_arty\/artifacts\/([^/]+)$/;
 const minimumLifetimeMilliseconds = 60_000;
 const maximumLifetimeMilliseconds = 30 * 86_400_000;
+const cleanupPageSize = 4;
+const maximumCleanupPages = 4;
+const maximumExpiredArtifacts = 5;
+const deleteBatchSize = 1_000;
 
 const notFound = (): Response => new Response("Not found", { status: 404 });
 const validPath = (path: string): boolean =>
@@ -219,4 +228,53 @@ const fetch = async (
   });
 };
 
-export default { fetch };
+const scheduled = async (
+  controller: { readonly scheduledTime: number },
+  environment: WorkerEnvironment,
+): Promise<void> => {
+  let cursor: string | undefined;
+  const manifestKeys: Array<string> = [];
+
+  for (let page = 0; page < maximumCleanupPages; page += 1) {
+    const listed = await environment.ARTIFACTS.list({
+      ...(cursor === undefined ? {} : { cursor }),
+      limit: cleanupPageSize,
+      prefix: "manifests/",
+    });
+    manifestKeys.push(...listed.objects.map(({ key }) => key));
+    if (!listed.truncated || listed.cursor === undefined) break;
+    cursor = listed.cursor;
+  }
+
+  let expiredArtifacts = 0;
+  for (const manifestKey of manifestKeys) {
+    if (expiredArtifacts >= maximumExpiredArtifacts) return;
+    try {
+      const manifestObject = await environment.ARTIFACTS.get(manifestKey);
+      if (manifestObject === null) continue;
+      const manifest = JSON.parse(
+        new TextDecoder().decode(await manifestObject.arrayBuffer()),
+      ) as ArtifactManifest;
+      if (controller.scheduledTime < Date.parse(manifest.expiresAt)) continue;
+
+      const artifactId = manifestKey.slice(
+        "manifests/".length,
+        -".json".length,
+      );
+      await environment.ARTIFACTS.delete(manifestKey);
+      expiredArtifacts += 1;
+      const fileKeys = manifest.files.map(
+        (file) => `staging/${artifactId}/${file.path}`,
+      );
+      for (let index = 0; index < fileKeys.length; index += deleteBatchSize) {
+        await environment.ARTIFACTS.delete(
+          fileKeys.slice(index, index + deleteBatchSize),
+        );
+      }
+    } catch {
+      // A later run or the lifecycle rule handles data left by partial cleanup.
+    }
+  }
+};
+
+export default { fetch, scheduled };
