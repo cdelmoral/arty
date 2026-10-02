@@ -202,6 +202,31 @@ interface CloudflareEnvelope<T> {
 
 const workerSource = `const ARTY_OWNER = "arty";
 const ARTY_PROTOCOL_VERSION = ${MANAGEMENT_PROTOCOL_VERSION};
+const cleanup = async (scheduledTime, env) => {
+  let cursor;
+  const manifestKeys = [];
+  for (let page = 0; page < 4; page += 1) {
+    const listed = await env.ARTIFACTS.list({ prefix: "manifests/", limit: 4, ...(cursor === undefined ? {} : { cursor }) });
+    manifestKeys.push(...listed.objects.map(object => object.key));
+    if (!listed.truncated || !listed.cursor) break;
+    cursor = listed.cursor;
+  }
+  let expired = 0;
+  for (const manifestKey of manifestKeys) {
+    if (expired >= 5) return;
+    try {
+      const stored = await env.ARTIFACTS.get(manifestKey);
+      if (!stored) continue;
+      const manifest = await stored.json();
+      if (scheduledTime < Date.parse(manifest.expiresAt)) continue;
+      const id = manifestKey.slice("manifests/".length, -".json".length);
+      await env.ARTIFACTS.delete(manifestKey);
+      expired += 1;
+      const keys = manifest.files.map(file => "staging/" + id + "/" + file.path);
+      for (let index = 0; index < keys.length; index += 1000) await env.ARTIFACTS.delete(keys.slice(index, index + 1000));
+    } catch {}
+  }
+};
 export default { async fetch(request, env) {
   const url = new URL(request.url);
   const management = /^\\/_arty\\/artifacts\\/([A-Za-z0-9_-]{32})$/.exec(url.pathname);
@@ -224,7 +249,7 @@ export default { async fetch(request, env) {
   const manifest = await manifestObject.json();
   const source = await env.ARTIFACTS.get("staging/" + viewer[1] + "/" + manifest.path);
   return source ? new Response(source.body, { headers: { "content-type": manifest.contentType } }) : new Response("Not found", { status: 404 });
-} };`;
+}, async scheduled(controller, env) { await cleanup(controller.scheduledTime, env); } };`;
 
 type CloudflareFetch = (
   input: string | URL | Request,
@@ -349,7 +374,7 @@ export const createCloudflareProvisioner = (
           rules: [
             {
               conditions: { prefix: "" },
-              delete_objects_transition: {
+              deleteObjectsTransition: {
                 condition: { maxAge: 35, type: "Age" },
               },
               enabled: true,
