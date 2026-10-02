@@ -146,7 +146,7 @@ export const createLocalWorkerProvider = (
             : 100 * 2 ** attempt * (0.5 + random());
         await sleep(delay);
       }
-      throw new ProviderError("Provider publication request failed.", {
+      throw new ProviderError("Provider publish request failed.", {
         cause: lastError,
       });
     };
@@ -157,7 +157,7 @@ export const createLocalWorkerProvider = (
         );
       }
       throw new ProviderError(
-        `Provider rejected publication (${response.status}).`,
+        `Provider rejected Artifact publish (${response.status}).`,
       );
     };
 
@@ -213,7 +213,7 @@ export const createLocalWorkerProvider = (
       };
       if (typeof result.expiresAt !== "string") {
         throw new ProviderError(
-          "Provider returned an invalid publication result.",
+          "Provider returned an invalid Artifact result.",
         );
       }
 
@@ -228,7 +228,7 @@ export const createLocalWorkerProvider = (
           method: "DELETE",
         });
       } catch {
-        // Cleanup is best effort; preserve the publication failure.
+        // Cleanup is best effort; preserve the publish failure.
       }
       throw error;
     }

@@ -108,6 +108,52 @@ describe("Cloudflare provisioning interface", () => {
         },
       ],
     });
+    const workerRequest = requests.find(
+      (request) =>
+        request.method === "PUT" &&
+        request.url.endsWith("/workers/scripts/arty"),
+    );
+    const workerForm = await workerRequest?.formData();
+    const deployedWorker = await (workerForm?.get("index.js") as File).text();
+    expect(deployedWorker).toContain("stagingPattern");
+    expect(deployedWorker).toContain("commitPattern");
+    expect(deployedWorker).toContain("x-arty-protocol-version");
+  });
+
+  test("does not claim a bucket after an ambiguous create response", async () => {
+    let bucketExists = false;
+    const mutations: Array<string> = [];
+    const provisioner = createCloudflareProvisioner(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.method !== "GET") mutations.push(request.url);
+      if (request.url.endsWith("/workers/scripts/arty")) {
+        return new Response(null, { status: 404 });
+      }
+      if (request.url.endsWith("/r2/buckets/arty-content")) {
+        return new Response(null, { status: bucketExists ? 200 : 404 });
+      }
+      if (request.method === "POST" && request.url.endsWith("/r2/buckets")) {
+        bucketExists = true;
+        throw new TypeError("connection closed");
+      }
+      return success();
+    });
+
+    await expect(
+      provisioner.provision({
+        accountId: "account-123",
+        allowExisting: false,
+        bucketName: "arty-content",
+        createSubdomain: false,
+        managementSecret: "management-secret",
+        subdomain: "publisher",
+        token: "api-token",
+        workerName: "arty",
+      }),
+    ).rejects.toThrow("could not prove ownership");
+    expect(
+      mutations.some((url) => url.endsWith("/arty-content/lifecycle")),
+    ).toBe(false);
   });
 
   test("refuses resource collisions that local configuration does not own", async () => {

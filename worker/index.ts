@@ -1,5 +1,7 @@
 import { MANAGEMENT_PROTOCOL_VERSION } from "../src/shared/protocol";
 
+const ARTY_OWNER = "arty";
+
 interface R2ObjectBody {
   arrayBuffer(): Promise<ArrayBuffer>;
 }
@@ -57,6 +59,7 @@ const cleanupPageSize = 4;
 const maximumCleanupPages = 4;
 const maximumExpiredArtifacts = 5;
 const deleteBatchSize = 1_000;
+const cleanupCursorKey = "_arty/cleanup-cursor";
 
 const notFound = (): Response => new Response("Not found", { status: 404 });
 const viewerHeaders = (): Headers =>
@@ -78,6 +81,22 @@ const decodeBase64 = (value: string): Uint8Array => {
   const decoded = atob(value);
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 };
+
+const validLifetime = (value: number): boolean =>
+  Number.isInteger(value) &&
+  value >= minimumLifetimeMilliseconds &&
+  value <= maximumLifetimeMilliseconds;
+
+const createManifest = (
+  files: ReadonlyArray<{ readonly contentType: string; readonly path: string }>,
+  lifetimeMilliseconds: number,
+  now: number,
+): ArtifactManifest => ({
+  files: files.map(({ contentType, path }) => ({ contentType, path })),
+  createdAt: new Date(now).toISOString(),
+  expiresAt: new Date(now + lifetimeMilliseconds).toISOString(),
+  version: MANAGEMENT_PROTOCOL_VERSION,
+});
 
 const authenticated = (
   request: Request,
@@ -213,11 +232,7 @@ const fetch = async (
     const lifetimeMilliseconds = Number(
       request.headers.get("x-arty-lifetime-ms"),
     );
-    if (
-      !Number.isInteger(lifetimeMilliseconds) ||
-      lifetimeMilliseconds < minimumLifetimeMilliseconds ||
-      lifetimeMilliseconds > maximumLifetimeMilliseconds
-    ) {
+    if (!validLifetime(lifetimeMilliseconds)) {
       return new Response(null, { status: 400 });
     }
     let payload: { files?: ReadonlyArray<CommitFilePayload> };
@@ -260,18 +275,11 @@ const fetch = async (
       paths.add(file.path);
     }
     if (!paths.has("index.html")) return new Response(null, { status: 400 });
-    const createdAtMilliseconds = (environment.now ?? Date.now)();
-    const manifest: ArtifactManifest = {
-      files: payload.files.map(({ contentType, path }) => ({
-        contentType,
-        path,
-      })),
-      createdAt: new Date(createdAtMilliseconds).toISOString(),
-      expiresAt: new Date(
-        createdAtMilliseconds + lifetimeMilliseconds,
-      ).toISOString(),
-      version: MANAGEMENT_PROTOCOL_VERSION,
-    };
+    const manifest = createManifest(
+      payload.files,
+      lifetimeMilliseconds,
+      (environment.now ?? Date.now)(),
+    );
     const committed = await environment.ARTIFACTS.put(
       manifestKey,
       JSON.stringify(manifest),
@@ -359,11 +367,7 @@ const fetch = async (
     const lifetimeMilliseconds = Number(
       request.headers.get("x-arty-lifetime-ms"),
     );
-    if (
-      !Number.isInteger(lifetimeMilliseconds) ||
-      lifetimeMilliseconds < minimumLifetimeMilliseconds ||
-      lifetimeMilliseconds > maximumLifetimeMilliseconds
-    ) {
+    if (!validLifetime(lifetimeMilliseconds)) {
       return new Response("Invalid Lifetime", { status: 400 });
     }
     let payload: { files?: ReadonlyArray<PublishFilePayload> };
@@ -413,15 +417,11 @@ const fetch = async (
       );
       if (staged === null) return new Response(null, { status: 409 });
     }
-    const createdAtMilliseconds = (environment.now ?? Date.now)();
-    const manifest: ArtifactManifest = {
-      files: files.map(({ contentType, path }) => ({ contentType, path })),
-      createdAt: new Date(createdAtMilliseconds).toISOString(),
-      expiresAt: new Date(
-        createdAtMilliseconds + lifetimeMilliseconds,
-      ).toISOString(),
-      version: MANAGEMENT_PROTOCOL_VERSION,
-    };
+    const manifest = createManifest(
+      files,
+      lifetimeMilliseconds,
+      (environment.now ?? Date.now)(),
+    );
     const committed = await environment.ARTIFACTS.put(
       `manifests/${artifactId}.json`,
       JSON.stringify(manifest),
@@ -526,8 +526,13 @@ const scheduled = async (
   controller: { readonly scheduledTime: number },
   environment: WorkerEnvironment,
 ): Promise<void> => {
-  let cursor: string | undefined;
+  const storedCursor = await environment.ARTIFACTS.get(cleanupCursorKey);
+  let cursor =
+    storedCursor === null
+      ? undefined
+      : new TextDecoder().decode(await storedCursor.arrayBuffer());
   const manifestKeys: Array<string> = [];
+  let nextCursor: string | undefined = cursor;
 
   for (let page = 0; page < maximumCleanupPages; page += 1) {
     const listed = await environment.ARTIFACTS.list({
@@ -538,6 +543,16 @@ const scheduled = async (
     manifestKeys.push(...listed.objects.map(({ key }) => key));
     if (!listed.truncated || listed.cursor === undefined) break;
     cursor = listed.cursor;
+    nextCursor = cursor;
+  }
+
+  if (
+    nextCursor === undefined ||
+    manifestKeys.length < cleanupPageSize * maximumCleanupPages
+  ) {
+    await environment.ARTIFACTS.delete(cleanupCursorKey);
+  } else {
+    await environment.ARTIFACTS.put(cleanupCursorKey, nextCursor);
   }
 
   let expiredArtifacts = 0;
