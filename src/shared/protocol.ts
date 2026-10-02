@@ -1,0 +1,1 @@
+export const MANAGEMENT_PROTOCOL_VERSION = 1;
