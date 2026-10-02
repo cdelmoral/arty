@@ -44,6 +44,11 @@ const durationInMilliseconds = (value: string): number | undefined => {
   return amount * multiplier;
 };
 
+export const lifetimeInMilliseconds = (value: string): number => {
+  validateLifetime(value);
+  return durationInMilliseconds(value) as number;
+};
+
 export const validateLifetime = (value: string): string => {
   const milliseconds = durationInMilliseconds(value);
   if (

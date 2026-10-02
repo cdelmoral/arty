@@ -13,6 +13,12 @@ export interface PublishFile {
 export interface PublishRequest {
   readonly artifactId: string;
   readonly files: ReadonlyArray<PublishFile>;
+  readonly lifetimeMilliseconds: number;
+}
+
+export interface PublishResult {
+  readonly accessUrl: string;
+  readonly expiresAt: string;
 }
 
 export interface DeleteRequest {
@@ -22,7 +28,7 @@ export interface DeleteRequest {
 
 export interface Provider {
   readonly delete: (request: DeleteRequest) => Promise<void>;
-  readonly publish: (request: PublishRequest) => Promise<string>;
+  readonly publish: (request: PublishRequest) => Promise<PublishResult>;
 }
 
 export class ProviderError extends Error {
@@ -84,7 +90,7 @@ export const createLocalWorkerProvider = (
       );
     }
   },
-  publish: async ({ artifactId, files }) => {
+  publish: async ({ artifactId, files, lifetimeMilliseconds }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
       throw new ProviderError(
         "ARTY_WORKER_URL and ARTY_MANAGEMENT_SECRET are required to publish.",
@@ -103,6 +109,7 @@ export const createLocalWorkerProvider = (
       headers: {
         authorization: `Bearer ${managementSecret}`,
         "content-type": "application/json",
+        "x-arty-lifetime-ms": String(lifetimeMilliseconds),
       },
       method: "PUT",
     });
@@ -112,7 +119,19 @@ export const createLocalWorkerProvider = (
       );
     }
 
-    return `${baseUrl}/${artifactId}/`;
+    const result = (await response.json()) as {
+      readonly expiresAt?: unknown;
+    };
+    if (typeof result.expiresAt !== "string") {
+      throw new ProviderError(
+        "Provider returned an invalid publication result.",
+      );
+    }
+
+    return {
+      accessUrl: `${baseUrl}/${artifactId}/`,
+      expiresAt: result.expiresAt,
+    };
   },
 });
 

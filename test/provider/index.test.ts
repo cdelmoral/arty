@@ -50,7 +50,10 @@ describe("configured Cloudflare Provider", () => {
         expect(request.headers.get("authorization")).not.toContain(
           "cloudflare-api-token",
         );
-        return new Response(null, { status: 201 });
+        return Response.json(
+          { expiresAt: "2026-10-09T12:00:00.000Z" },
+          { status: 201 },
+        );
       },
       platform: "linux",
     };
@@ -72,11 +75,14 @@ describe("configured Cloudflare Provider", () => {
             path: "index.html",
           },
         ],
+        lifetimeMilliseconds: 604_800_000,
       },
     );
 
-    expect(accessUrl).toBe(
-      "https://arty.publisher.workers.dev/________________________________/",
-    );
+    expect(accessUrl).toEqual({
+      accessUrl:
+        "https://arty.publisher.workers.dev/________________________________/",
+      expiresAt: "2026-10-09T12:00:00.000Z",
+    });
   });
 });

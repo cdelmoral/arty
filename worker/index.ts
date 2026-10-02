@@ -17,6 +17,7 @@ interface R2BucketBinding {
 export interface WorkerEnvironment {
   readonly ARTIFACTS: R2BucketBinding;
   readonly MANAGEMENT_SECRET: string;
+  readonly now?: () => number;
 }
 
 interface ArtifactManifest {
@@ -24,6 +25,8 @@ interface ArtifactManifest {
     readonly contentType: string;
     readonly path: string;
   }>;
+  readonly createdAt: string;
+  readonly expiresAt: string;
   readonly version: number;
 }
 
@@ -35,6 +38,8 @@ interface PublishFilePayload {
 
 const artifactIdPattern = /^[A-Za-z0-9_-]{32}$/;
 const managementPattern = /^\/_arty\/artifacts\/([^/]+)$/;
+const minimumLifetimeMilliseconds = 60_000;
+const maximumLifetimeMilliseconds = 30 * 86_400_000;
 
 const notFound = (): Response => new Response("Not found", { status: 404 });
 const validPath = (path: string): boolean =>
@@ -98,7 +103,16 @@ const fetch = async (
       }
       return new Response(null, { status: 204 });
     }
-
+    const lifetimeMilliseconds = Number(
+      request.headers.get("x-arty-lifetime-ms"),
+    );
+    if (
+      !Number.isInteger(lifetimeMilliseconds) ||
+      lifetimeMilliseconds < minimumLifetimeMilliseconds ||
+      lifetimeMilliseconds > maximumLifetimeMilliseconds
+    ) {
+      return new Response("Invalid Lifetime", { status: 400 });
+    }
     let payload: { files?: ReadonlyArray<PublishFilePayload> };
     try {
       payload = (await request.json()) as typeof payload;
@@ -146,8 +160,13 @@ const fetch = async (
       );
       if (staged === null) return new Response(null, { status: 409 });
     }
+    const createdAtMilliseconds = (environment.now ?? Date.now)();
     const manifest: ArtifactManifest = {
       files: files.map(({ contentType, path }) => ({ contentType, path })),
+      createdAt: new Date(createdAtMilliseconds).toISOString(),
+      expiresAt: new Date(
+        createdAtMilliseconds + lifetimeMilliseconds,
+      ).toISOString(),
       version: MANAGEMENT_PROTOCOL_VERSION,
     };
     const committed = await environment.ARTIFACTS.put(
@@ -155,12 +174,13 @@ const fetch = async (
       JSON.stringify(manifest),
       { onlyIf: { etagDoesNotMatch: "*" } },
     );
-    return new Response(null, { status: committed === null ? 409 : 201 });
+    if (committed === null) return new Response(null, { status: 409 });
+    return Response.json(
+      { createdAt: manifest.createdAt, expiresAt: manifest.expiresAt },
+      { status: 201 },
+    );
   }
 
-  if (request.method !== "GET") {
-    return new Response(null, { status: 405 });
-  }
   const viewerMatch = /^\/([^/]+)\/(.*)$/.exec(url.pathname);
   const artifactId = viewerMatch?.[1];
   if (artifactId === undefined || !artifactIdPattern.test(artifactId)) {
@@ -173,6 +193,12 @@ const fetch = async (
   const manifest = JSON.parse(
     new TextDecoder().decode(await manifestObject.arrayBuffer()),
   ) as ArtifactManifest;
+  if ((environment.now ?? Date.now)() >= Date.parse(manifest.expiresAt)) {
+    return notFound();
+  }
+  if (request.method !== "GET") {
+    return new Response(null, { status: 405 });
+  }
   let requestedPath: string;
   try {
     requestedPath = decodeURIComponent(viewerMatch?.[2] ?? "") || "index.html";
@@ -186,7 +212,10 @@ const fetch = async (
   );
   if (source === null) return notFound();
   return new Response(await source.arrayBuffer(), {
-    headers: { "content-type": file.contentType },
+    headers: {
+      "cache-control": "private, no-cache",
+      "content-type": file.contentType,
+    },
   });
 };
 

@@ -102,7 +102,10 @@ describe("CLI application", () => {
       delete: unusedProvider.delete,
       publish: async (request) => {
         requests.push(request);
-        return `https://arty.example/${request.artifactId}/`;
+        return {
+          accessUrl: `https://arty.example/${request.artifactId}/`,
+          expiresAt: "2026-10-09T12:00:00.000Z",
+        };
       },
     };
 
@@ -117,16 +120,116 @@ describe("CLI application", () => {
 
     expect(result).toEqual({
       exitCode: 0,
-      stderr: "Published Artifact.\n",
+      stderr: "Published Artifact. Expires at 2026-10-09T12:00:00.000Z.\n",
       stdout: "https://arty.example/________________________________/\n",
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.artifactId).toBe("________________________________");
+    expect(requests[0]?.lifetimeMilliseconds).toBe(7 * 86_400_000);
     expect(requests[0]?.files[0]?.path).toBe("index.html");
     expect(new TextDecoder().decode(requests[0]?.files[0]?.content)).toBe(
       "<h1>Hello from Arty</h1>",
     );
   });
+
+  test.each([
+    ["minimum", "1m", 60_000],
+    ["maximum", "30d", 30 * 86_400_000],
+  ])(
+    "uses the %s per-command Lifetime override",
+    async (_name, lifetime, lifetimeMilliseconds) => {
+      const sourceDirectory = await mkdtemp(
+        join(tmpdir(), "arty-source-test-"),
+      );
+      temporaryDirectories.push(sourceDirectory);
+      const sourcePath = join(sourceDirectory, "prototype.html");
+      await Bun.write(sourcePath, "<h1>Temporary</h1>");
+      const requests: Array<number> = [];
+      const provider: Provider = {
+        delete: unusedProvider.delete,
+        publish: async (request) => {
+          requests.push(request.lifetimeMilliseconds);
+          return {
+            accessUrl: `https://arty.example/${request.artifactId}/`,
+            expiresAt: "2026-11-01T00:00:00.000Z",
+          };
+        },
+      };
+
+      const result = await invoke(
+        ["publish", "--lifetime", lifetime, sourcePath],
+        {},
+        { provider },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(
+        "https://arty.example/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/\n",
+      );
+      expect(result.stderr).toContain("Expires at 2026-11-01T00:00:00.000Z.");
+      expect(requests).toEqual([lifetimeMilliseconds]);
+    },
+  );
+
+  test("uses the configured default Lifetime", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-config-test-"));
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "arty-source-test-"));
+    temporaryDirectories.push(configHome, sourceDirectory);
+    const sourcePath = join(sourceDirectory, "prototype.html");
+    await Bun.write(sourcePath, "<h1>Configured</h1>");
+    await mkdir(join(configHome, "arty"), { recursive: true });
+    await Bun.write(
+      join(configHome, "arty", "config.json"),
+      '{"defaultLifetime":"90m"}',
+    );
+    const requests: Array<number> = [];
+    const provider: Provider = {
+      delete: unusedProvider.delete,
+      publish: async (request) => {
+        requests.push(request.lifetimeMilliseconds);
+        return {
+          accessUrl: `https://arty.example/${request.artifactId}/`,
+          expiresAt: "2026-10-02T13:30:00.000Z",
+        };
+      },
+    };
+
+    const result = await invoke(
+      ["publish", sourcePath],
+      { XDG_CONFIG_HOME: configHome },
+      { provider },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(requests).toEqual([90 * 60_000]);
+  });
+
+  test.each(["59s", "31d", "forever"])(
+    "rejects an invalid publish Lifetime before calling the Provider: %s",
+    async (lifetime) => {
+      let providerCalls = 0;
+      const provider: Provider = {
+        delete: unusedProvider.delete,
+        publish: async () => {
+          providerCalls += 1;
+          throw new Error("Provider should not be called");
+        },
+      };
+
+      const result = await invoke(
+        ["publish", "--lifetime", lifetime, "prototype.html"],
+        {},
+        { provider },
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(
+        "Lifetime must be between 1 minute and 30 days",
+      );
+      expect(providerCalls).toBe(0);
+    },
+  );
 
   test.each([
     ["no Source", []],
@@ -141,7 +244,10 @@ describe("CLI application", () => {
       delete: unusedProvider.delete,
       publish: async () => {
         providerCalls += 1;
-        return "https://arty.example/unexpected/";
+        return {
+          accessUrl: "https://arty.example/unexpected/",
+          expiresAt: "2026-10-09T12:00:00.000Z",
+        };
       },
     };
 
@@ -235,7 +341,10 @@ describe("CLI application", () => {
           delete: unusedProvider.delete,
           publish: async () => {
             providerCalls += 1;
-            return "https://arty.example/unexpected/";
+            return {
+              accessUrl: "https://arty.example/unexpected/",
+              expiresAt: "2026-10-09T12:00:00.000Z",
+            };
           },
         },
       },
@@ -264,7 +373,10 @@ describe("CLI application", () => {
       delete: unusedProvider.delete,
       publish: async (request) => {
         requests.push(request);
-        return `https://arty.example/${request.artifactId}/`;
+        return {
+          accessUrl: `https://arty.example/${request.artifactId}/`,
+          expiresAt: "2026-10-09T12:00:00.000Z",
+        };
       },
     };
 
@@ -355,7 +467,10 @@ describe("CLI application", () => {
             delete: unusedProvider.delete,
             publish: async () => {
               providerCalls += 1;
-              return "https://arty.example/unexpected/";
+              return {
+                accessUrl: "https://arty.example/unexpected/",
+                expiresAt: "2026-10-09T12:00:00.000Z",
+              };
             },
           },
         },
@@ -372,7 +487,7 @@ describe("CLI application", () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  --lifetime <duration>      Lifetime for this Artifact\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
     });
   });
 
