@@ -1,4 +1,6 @@
-import { lstat, readFile, readdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { lstat, readdir } from "node:fs/promises";
+import { Readable } from "node:stream";
 import { extname, join, relative, sep } from "node:path";
 
 import { Effect } from "effect";
@@ -61,6 +63,7 @@ interface SourceFile {
   readonly inode: number;
   readonly path: string;
   readonly size: number;
+  readonly modifiedAt: number;
 }
 
 const inspectFile = async (
@@ -83,23 +86,33 @@ const inspectFile = async (
     inode: metadata.ino,
     path,
     size: metadata.size,
+    modifiedAt: metadata.mtimeMs,
   };
 };
 
-const readInspectedFile = async (file: SourceFile): Promise<PublishFile> => {
-  const content = await readFile(file.absolutePath);
+const verifyInspectedFile = async (file: SourceFile): Promise<void> => {
   const metadata = await lstat(file.absolutePath);
   if (
     !metadata.isFile() ||
     metadata.dev !== file.device ||
     metadata.ino !== file.inode ||
     metadata.size !== file.size ||
-    content.byteLength !== file.size
+    metadata.mtimeMs !== file.modifiedAt
   ) {
     throw new PublishError(`Source changed during validation: ${file.path}`);
   }
-  return { content, contentType: contentTypeFor(file.path), path: file.path };
 };
+
+const publishFile = (file: SourceFile): PublishFile => ({
+  contentType: contentTypeFor(file.path),
+  open: () =>
+    Readable.toWeb(
+      createReadStream(file.absolutePath),
+    ) as unknown as ReadableStream<Uint8Array>,
+  path: file.path,
+  size: file.size,
+  verify: () => verifyInspectedFile(file),
+});
 
 const readDirectory = async (
   root: string,
@@ -139,9 +152,7 @@ const readDirectory = async (
   if (!files.some((file) => file.path === "index.html")) {
     throw new PublishError("Directory Source must contain a root index.html.");
   }
-  const contents: Array<PublishFile> = [];
-  for (const file of files) contents.push(await readInspectedFile(file));
-  return contents;
+  return files.map(publishFile);
 };
 
 const readSource = async (
@@ -165,7 +176,7 @@ const readSource = async (
       throw new PublishError("Source must be a .html or .htm file.");
     }
     const file = await inspectFile(path, "index.html");
-    return [await readInspectedFile(file)];
+    return [publishFile(file)];
   } catch (error) {
     if (error instanceof PublishError) throw error;
     throw new PublishError(`Source does not exist: ${path}`);
@@ -181,7 +192,7 @@ export const publish = (
   PublishError
 > =>
   Effect.tryPromise({
-    try: async () => {
+    try: async (signal) => {
       const files = await readSource(path);
       const randomBytes = environment.randomBytes(24);
       if (randomBytes.byteLength !== 24) {
@@ -191,6 +202,7 @@ export const publish = (
         artifactId: artifactIdFrom(randomBytes),
         files,
         lifetimeMilliseconds,
+        signal,
       });
     },
     catch: (error) =>
