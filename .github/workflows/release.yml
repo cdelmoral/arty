@@ -95,6 +95,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/arty"
           keychain="$RUNNER_TEMP/arty-smoke.keychain-db"
           security create-keychain -p "" "$keychain"
           trap 'security delete-keychain "$keychain"' EXIT

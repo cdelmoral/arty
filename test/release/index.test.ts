@@ -36,6 +36,29 @@ describe("release configuration", () => {
     }
   });
 
+  test("gives macOS smoke executables a stable code identity before Keychain access", async () => {
+    const ci = await read(".github/workflows/ci.yml");
+    const release = await read(".github/workflows/release.yml");
+
+    const ciSigning = ci.indexOf(
+      'codesign --force --sign - --identifier dev.arty.cli "$RUNNER_TEMP/arty"',
+    );
+    expect(ciSigning).toBeGreaterThan(-1);
+    expect(ciSigning).toBeLessThan(ci.indexOf("Smoke test macOS Keychain"));
+
+    const releaseSigning = release.indexOf(
+      'codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/arty',
+    );
+    expect(releaseSigning).toBeGreaterThan(-1);
+    expect(releaseSigning).toBeLessThan(
+      release.indexOf("Smoke test macOS Keychain"),
+    );
+    expect(release).toContain(
+      'codesign --verify --strict --verbose=2 "$RUNNER_TEMP/arty"',
+    );
+    expect(release).not.toContain("codesign --force --sign -");
+  });
+
   test("publishes verified outputs without publishing an npm package", async () => {
     const workflow = await read(".github/workflows/release.yml");
 

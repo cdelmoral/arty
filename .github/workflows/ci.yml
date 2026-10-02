@@ -55,6 +55,11 @@ jobs:
         run: |
           mv dist/arty "$RUNNER_TEMP/arty"
           mv dist/arty-help-baseline "$RUNNER_TEMP/arty-help-baseline"
+      - name: Give the macOS executable a stable CI identity
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - --identifier dev.arty.cli "$RUNNER_TEMP/arty"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/arty"
       - name: Install Linux Secret Service
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes dbus-x11 gnome-keyring
