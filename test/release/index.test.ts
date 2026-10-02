@@ -59,6 +59,27 @@ describe("release configuration", () => {
     expect(release).not.toContain("codesign --force --sign -");
   });
 
+  test("starts Linux Secret Service with isolated state and exported control environment", async () => {
+    for (const path of [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+    ]) {
+      const workflow = await read(path);
+      expect(workflow).toContain('export HOME="$RUNNER_TEMP/keyring-home"');
+      expect(workflow).toContain('export XDG_DATA_HOME="$HOME/.local/share"');
+      expect(workflow).toContain(
+        'export GNOME_KEYRING_CONTROL="$XDG_RUNTIME_DIR/keyring"',
+      );
+      expect(workflow).toContain("gnome-keyring-daemon --login");
+      expect(workflow).toContain(
+        'eval "$(gnome-keyring-daemon --start --components=secrets)"',
+      );
+      expect(workflow).not.toContain(
+        "gnome-keyring-daemon --unlock --components=secrets",
+      );
+    }
+  });
+
   test("publishes verified outputs without publishing an npm package", async () => {
     const workflow = await read(".github/workflows/release.yml");
 
