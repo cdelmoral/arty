@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "bun build --compile --minify --outfile dist/arty src/cli/main.ts",
+    "build:baseline": "bun build --compile --minify --outfile dist/arty-help-baseline bench/help-baseline.ts",
     "check": "bun run format:check && bun run typecheck && bun test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -15,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@napi-rs/keyring": "2.1.0",
     "commander": "15.0.0",
     "effect": "4.0.0"
   },
