@@ -1,3 +1,9 @@
+import { managementSecretAccount } from "../cloudflare";
+import type { ConfigEnvironment } from "../config";
+import { getCloudflareConfig } from "../config";
+import type { CredentialStore } from "../credentials";
+import { resolveCredential } from "../credentials";
+
 export interface PublishFile {
   readonly content: Uint8Array;
   readonly contentType: string;
@@ -33,13 +39,18 @@ export class ProviderNotFoundError extends ProviderError {
   readonly name = "ProviderNotFoundError";
 }
 
+type ProviderFetch = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
 const retryableStatus = (status: number): boolean =>
   status === 429 || [500, 502, 503, 504].includes(status);
 
 export const createLocalWorkerProvider = (
   workerUrl: string | undefined,
   managementSecret: string | undefined,
-  request: typeof fetch = fetch,
+  request: ProviderFetch = fetch,
 ): Provider => ({
   delete: async ({ artifactId, operationId }) => {
     if (workerUrl === undefined || managementSecret === undefined) {
@@ -123,3 +134,33 @@ export const createLocalWorkerProvider = (
     };
   },
 });
+
+export const createConfiguredCloudflareProvider = (
+  runtime: ConfigEnvironment & {
+    readonly credentialStore: CredentialStore;
+    readonly environment: Readonly<Record<string, string | undefined>>;
+    readonly fetch?: ProviderFetch;
+  },
+): Provider => {
+  const configuredProvider = async (): Promise<Provider> => {
+    const config = await getCloudflareConfig(runtime);
+    if (config === undefined) {
+      throw new ProviderError("Run `arty init cloudflare` before publishing.");
+    }
+    const managementSecret = await resolveCredential(
+      managementSecretAccount(config.accountId),
+      "ARTY_MANAGEMENT_SECRET",
+      { environment: runtime.environment, store: runtime.credentialStore },
+    );
+    return createLocalWorkerProvider(
+      config.workerUrl,
+      managementSecret,
+      runtime.fetch,
+    );
+  };
+
+  return {
+    delete: async (request) => (await configuredProvider()).delete(request),
+    publish: async (request) => (await configuredProvider()).publish(request),
+  };
+};

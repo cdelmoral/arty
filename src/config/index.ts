@@ -13,7 +13,16 @@ export interface ConfigEnvironment {
   readonly platform: NodeJS.Platform;
 }
 
+export interface CloudflareConfig {
+  readonly accountId: string;
+  readonly bucketName: string;
+  readonly protocolVersion: number;
+  readonly workerName: string;
+  readonly workerUrl: string;
+}
+
 interface ConfigFile {
+  readonly cloudflare?: CloudflareConfig;
   readonly defaultLifetime?: string;
 }
 
@@ -95,19 +104,67 @@ const readConfig = async (runtime: ConfigEnvironment): Promise<ConfigFile> => {
       throw new ConfigError("Arty configuration is invalid.");
     }
 
-    const defaultLifetime = (parsed as { defaultLifetime?: unknown })
-      .defaultLifetime;
+    const config = parsed as {
+      cloudflare?: unknown;
+      defaultLifetime?: unknown;
+    };
+    const defaultLifetime = config.defaultLifetime;
     if (defaultLifetime !== undefined && typeof defaultLifetime !== "string") {
       throw new ConfigError("Arty configuration is invalid.");
     }
 
-    return { defaultLifetime };
+    const cloudflare = config.cloudflare;
+    if (cloudflare !== undefined && !isCloudflareConfig(cloudflare)) {
+      throw new ConfigError("Arty configuration is invalid.");
+    }
+
+    return { cloudflare, defaultLifetime };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof ConfigError) throw error;
     throw new ConfigError("Arty configuration could not be read.");
   }
 };
+
+const isCloudflareConfig = (value: unknown): value is CloudflareConfig =>
+  typeof value === "object" &&
+  value !== null &&
+  !Array.isArray(value) &&
+  typeof (value as CloudflareConfig).accountId === "string" &&
+  typeof (value as CloudflareConfig).bucketName === "string" &&
+  typeof (value as CloudflareConfig).protocolVersion === "number" &&
+  typeof (value as CloudflareConfig).workerName === "string" &&
+  typeof (value as CloudflareConfig).workerUrl === "string";
+
+const writeConfig = async (
+  runtime: ConfigEnvironment,
+  config: ConfigFile,
+): Promise<void> => {
+  const directory = configDirectory(runtime);
+  const path = configPath(runtime);
+  const temporaryPath = `${path}.${process.pid}.tmp`;
+
+  try {
+    await mkdir(directory, { mode: 0o700, recursive: true });
+    await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    await rename(temporaryPath, path);
+  } catch {
+    throw new ConfigError("Arty configuration could not be written.");
+  }
+};
+
+export const getCloudflareConfig = async (
+  runtime: ConfigEnvironment,
+): Promise<CloudflareConfig | undefined> =>
+  (await readConfig(runtime)).cloudflare;
+
+export const setCloudflareConfig = async (
+  runtime: ConfigEnvironment,
+  cloudflare: CloudflareConfig,
+): Promise<void> =>
+  writeConfig(runtime, { ...(await readConfig(runtime)), cloudflare });
 
 export const getDefaultLifetime = async (
   runtime: ConfigEnvironment,
@@ -121,19 +178,8 @@ export const setDefaultLifetime = async (
   value: string,
 ): Promise<void> => {
   const defaultLifetime = validateLifetime(value);
-  const directory = configDirectory(runtime);
-  const path = configPath(runtime);
-  const temporaryPath = `${path}.${process.pid}.tmp`;
-
-  try {
-    await mkdir(directory, { mode: 0o700, recursive: true });
-    await writeFile(
-      temporaryPath,
-      `${JSON.stringify({ defaultLifetime }, null, 2)}\n`,
-      { mode: 0o600 },
-    );
-    await rename(temporaryPath, path);
-  } catch {
-    throw new ConfigError("Arty configuration could not be written.");
-  }
+  await writeConfig(runtime, {
+    ...(await readConfig(runtime)),
+    defaultLifetime,
+  });
 };

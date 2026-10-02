@@ -12,6 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runCli, type CliOutput, type CliRuntime } from "../../src/cli/app";
+import type {
+  CloudflareProvisionRequest,
+  CloudflareProvisioner,
+} from "../../src/cloudflare";
 import type { CredentialStore } from "../../src/credentials";
 import {
   createLocalWorkerProvider,
@@ -31,6 +35,14 @@ const unusedProvider: Provider = {
   },
   publish: async () => {
     throw new Error("Provider should not be called");
+  },
+};
+const unusedProvisioner: CloudflareProvisioner = {
+  getWorkersSubdomain: async () => {
+    throw new Error("Cloudflare should not be called");
+  },
+  provision: async () => {
+    throw new Error("Cloudflare should not be called");
   },
 };
 
@@ -61,7 +73,13 @@ const invoke = async (
   const exitCode = await runCli(argv, output, {
     credentialStore: unusedCredentialStore,
     environment,
+    initialization: {
+      confirm: async () => false,
+      promptSecret: async () => "",
+      promptText: async () => "",
+    },
     platform: "linux",
+    provisioner: unusedProvisioner,
     provider: unusedProvider,
     randomBytes: (length) => new Uint8Array(length),
     ...runtime,
@@ -469,7 +487,7 @@ describe("CLI application", () => {
     expect(await invoke(["--help"])).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                   local HTML Source to publish\n\nOptions:\n  -V, --version          output the version number\n  --lifetime <duration>  Lifetime for this Artifact\n  -h, --help             display help for command\n\nCommands:\n  publish <path>         Publish one local Source.\n  delete <url-or-id>     Delete an Artifact before expiry.\n  config                 Manage Arty settings.\n`,
+      stdout: `Usage: arty [options] [command] [path]\n\nPublish temporary static Artifacts from local Sources.\n\nArguments:\n  path                       local HTML Source to publish\n\nOptions:\n  -V, --version              output the version number\n  --lifetime <duration>      Lifetime for this Artifact\n  -h, --help                 display help for command\n\nCommands:\n  publish <path>             Publish one local Source.\n  init [options] <provider>  Initialize a Provider account.\n  delete <url-or-id>         Delete an Artifact before expiry.\n  config                     Manage Arty settings.\n`,
     });
   });
 
@@ -544,6 +562,234 @@ describe("CLI application", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("error: unknown option '--unknown'");
+  });
+
+  test("initializes Cloudflare after informed automated consent", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
+    temporaryDirectories.push(configHome);
+    const credentials = new Map<string, string>();
+    const credentialStore: CredentialStore = {
+      delete: async (account) => {
+        credentials.delete(account);
+      },
+      get: async (account) => credentials.get(account),
+      set: async (account, value) => {
+        credentials.set(account, value);
+      },
+    };
+    const requests: Array<CloudflareProvisionRequest> = [];
+    const provisioner: CloudflareProvisioner = {
+      getWorkersSubdomain: async (accountId, token) => {
+        expect(accountId).toBe("account-123");
+        expect(token).toBe("cloudflare-secret-token");
+        return "publisher";
+      },
+      provision: async (request) => {
+        requests.push(request);
+        return { workerUrl: "https://arty.publisher.workers.dev" };
+      },
+    };
+
+    const result = await invoke(
+      ["init", "cloudflare", "--yes"],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "cloudflare-secret-token",
+        XDG_CONFIG_HOME: configHome,
+      },
+      {
+        credentialStore,
+        provisioner,
+        randomBytes: () => new Uint8Array(32).fill(7),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("private R2 bucket");
+    expect(result.stderr).toContain("Cloudflare charges");
+    expect(result.stderr).toContain("Sources may execute JavaScript");
+    expect(result.stderr).not.toContain("cloudflare-secret-token");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      accountId: "account-123",
+      bucketName: "arty-content",
+      subdomain: "publisher",
+      token: "cloudflare-secret-token",
+      workerName: "arty",
+    });
+    expect(requests[0]?.managementSecret).toHaveLength(43);
+    expect(credentials.get("cloudflare:account-123:api-token")).toBe(
+      "cloudflare-secret-token",
+    );
+    expect(credentials.get("cloudflare:account-123:management-secret")).toBe(
+      requests[0]?.managementSecret,
+    );
+    expect(
+      JSON.parse(
+        await readFile(join(configHome, "arty", "config.json"), "utf8"),
+      ),
+    ).toEqual({
+      cloudflare: {
+        accountId: "account-123",
+        bucketName: "arty-content",
+        protocolVersion: 1,
+        workerName: "arty",
+        workerUrl: "https://arty.publisher.workers.dev",
+      },
+    });
+  });
+
+  test("asks for a missing workers.dev subdomain and explains its account scope", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
+    temporaryDirectories.push(configHome);
+    const prompts: Array<string> = [];
+    const provisioner: CloudflareProvisioner = {
+      getWorkersSubdomain: async () => undefined,
+      provision: async (request) => ({
+        workerUrl: `https://${request.workerName}.${request.subdomain}.workers.dev`,
+      }),
+    };
+
+    const result = await invoke(
+      ["init", "cloudflare", "--yes"],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "token",
+        XDG_CONFIG_HOME: configHome,
+      },
+      {
+        initialization: {
+          confirm: async () => true,
+          promptSecret: async () => "unused",
+          promptText: async (message) => {
+            prompts.push(message);
+            return "new-publisher";
+          },
+        },
+        provisioner,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("account-wide");
+    expect(prompts).toEqual(["Choose a workers.dev subdomain: "]);
+  });
+
+  test("cancels before reading credentials or changing Cloudflare", async () => {
+    let secretPrompts = 0;
+    let cloudflareCalls = 0;
+
+    const result = await invoke(
+      ["init", "cloudflare"],
+      {},
+      {
+        initialization: {
+          confirm: async () => false,
+          promptSecret: async () => {
+            secretPrompts += 1;
+            return "unused";
+          },
+          promptText: async () => "unused",
+        },
+        provisioner: {
+          getWorkersSubdomain: async () => {
+            cloudflareCalls += 1;
+            return "unused";
+          },
+          provision: async () => {
+            cloudflareCalls += 1;
+            return { workerUrl: "https://unused.example" };
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Cloudflare charges");
+    expect(result.stderr).toContain("Initialization cancelled");
+    expect(secretPrompts).toBe(0);
+    expect(cloudflareCalls).toBe(0);
+  });
+
+  test("accepts a prompted token and alternate resource names", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "arty-init-test-"));
+    temporaryDirectories.push(configHome);
+    const requests: Array<CloudflareProvisionRequest> = [];
+
+    const result = await invoke(
+      [
+        "init",
+        "cloudflare",
+        "--yes",
+        "--worker-name",
+        "review-worker",
+        "--bucket-name",
+        "review-content",
+      ],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        XDG_CONFIG_HOME: configHome,
+      },
+      {
+        initialization: {
+          confirm: async () => true,
+          promptSecret: async (message) => {
+            expect(message).toBe("Cloudflare API token: ");
+            return "prompted-token";
+          },
+          promptText: async () => "unused",
+        },
+        provisioner: {
+          getWorkersSubdomain: async () => "publisher",
+          provision: async (request) => {
+            requests.push(request);
+            return {
+              workerUrl: "https://review-worker.publisher.workers.dev",
+            };
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(requests[0]).toMatchObject({
+      bucketName: "review-content",
+      token: "prompted-token",
+      workerName: "review-worker",
+    });
+    expect(result.stderr).not.toContain("prompted-token");
+  });
+
+  test("rejects a legacy Global API Key before calling Cloudflare", async () => {
+    let cloudflareCalls = 0;
+    const result = await invoke(
+      ["init", "cloudflare", "--yes"],
+      {
+        CLOUDFLARE_ACCOUNT_ID: "account-123",
+        CLOUDFLARE_API_TOKEN: "token",
+        CLOUDFLARE_GLOBAL_API_KEY: "legacy-key",
+      },
+      {
+        provisioner: {
+          getWorkersSubdomain: async () => {
+            cloudflareCalls += 1;
+            return "publisher";
+          },
+          provision: async () => {
+            cloudflareCalls += 1;
+            return { workerUrl: "https://unused.example" };
+          },
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Global API Key is not supported");
+    expect(result.stderr).not.toContain("legacy-key");
+    expect(cloudflareCalls).toBe(0);
   });
 
   test("reports the seven-day default Lifetime", async () => {

@@ -2,6 +2,13 @@ import { Command, CommanderError } from "commander";
 import { Effect } from "effect";
 
 import {
+  createCloudflareProvisioner,
+  InitializationError,
+  initializeCloudflare,
+  type CloudflareProvisioner,
+  type InitializationIO,
+} from "../cloudflare";
+import {
   ConfigError,
   getDefaultLifetime,
   lifetimeInMilliseconds,
@@ -15,7 +22,7 @@ import {
   type CredentialStore,
 } from "../credentials";
 import { deleteArtifact, DeleteError } from "../delete";
-import { createLocalWorkerProvider, type Provider } from "../provider";
+import { createConfiguredCloudflareProvider, type Provider } from "../provider";
 import { publish, PublishError } from "../publish";
 
 export interface CliOutput {
@@ -25,7 +32,9 @@ export interface CliOutput {
 
 export interface CliRuntime extends ConfigEnvironment {
   readonly credentialStore: CredentialStore;
+  readonly initialization: InitializationIO;
   readonly provider: Provider;
+  readonly provisioner: CloudflareProvisioner;
   readonly randomBytes: (length: number) => Uint8Array;
 }
 
@@ -66,6 +75,37 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
     .action(async (path: string) => {
       await publishSource(path, program.opts<{ lifetime?: string }>().lifetime);
     });
+
+  program
+    .command("init")
+    .description("Initialize a Provider account.")
+    .argument("<provider>")
+    .option("--yes", "accept the resource and charge warning")
+    .option("--worker-name <name>", "Worker name", "arty")
+    .option("--bucket-name <name>", "R2 bucket name", "arty-content")
+    .action(
+      async (
+        provider: string,
+        options: {
+          readonly bucketName: string;
+          readonly workerName: string;
+          readonly yes?: boolean;
+        },
+      ) => {
+        if (provider !== "cloudflare") {
+          throw new InitializationError(`Unknown Provider: ${provider}`);
+        }
+        await initializeCloudflare(
+          {
+            bucketName: options.bucketName,
+            workerName: options.workerName,
+            yes: options.yes ?? false,
+          },
+          output,
+          runtime,
+        );
+      },
+    );
 
   program
     .command("delete")
@@ -118,21 +158,27 @@ const createProgram = (output: CliOutput, runtime: CliRuntime) => {
 export const runCli = (
   argv: ReadonlyArray<string>,
   output: CliOutput,
-  runtime: CliRuntime = {
-    credentialStore: nativeCredentialStore,
-    environment: process.env,
-    platform: process.platform,
-    provider: createLocalWorkerProvider(
-      process.env.ARTY_WORKER_URL,
-      process.env.ARTY_MANAGEMENT_SECRET,
-    ),
-    randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
-  },
+  runtime?: CliRuntime,
 ): Promise<number> =>
   Effect.runPromise(
     Effect.promise(async () => {
+      const productionRuntimeBase = {
+        credentialStore: nativeCredentialStore,
+        environment: process.env,
+        initialization: createTerminalInitializationIO(),
+        platform: process.platform,
+        provisioner: createCloudflareProvisioner(),
+        randomBytes: (length: number) =>
+          crypto.getRandomValues(new Uint8Array(length)),
+      };
+      const activeRuntime: CliRuntime =
+        runtime ??
+        ({
+          ...productionRuntimeBase,
+          provider: createConfiguredCloudflareProvider(productionRuntimeBase),
+        } satisfies CliRuntime);
       try {
-        await createProgram(output, runtime).parseAsync([...argv], {
+        await createProgram(output, activeRuntime).parseAsync([...argv], {
           from: "user",
         });
         return 0;
@@ -144,6 +190,7 @@ export const runCli = (
         if (
           error instanceof ConfigError ||
           error instanceof CredentialError ||
+          error instanceof InitializationError ||
           error instanceof DeleteError ||
           error instanceof PublishError
         ) {
@@ -155,3 +202,57 @@ export const runCli = (
       }
     }),
   );
+
+const createTerminalInitializationIO = (): InitializationIO => ({
+  confirm: async (message) => {
+    const answer = await prompt(message, false);
+    return /^(y|yes)$/i.test(answer.trim());
+  },
+  promptSecret: (message) => prompt(message, true),
+  promptText: (message) => prompt(message, false),
+});
+
+const prompt = async (message: string, hidden: boolean): Promise<string> => {
+  process.stderr.write(message);
+  if (!process.stdin.isTTY) {
+    throw new InitializationError(
+      "Interactive input is unavailable. Set the required environment variables.",
+    );
+  }
+  process.stdin.setRawMode(hidden);
+  process.stdin.resume();
+  process.stdin.setEncoding("utf8");
+  return await new Promise<string>((resolve, reject) => {
+    let value = "";
+    const cleanup = () => {
+      process.stdin.off("data", onData);
+      process.stdin.off("error", onError);
+      process.stdin.pause();
+      if (hidden) process.stdin.setRawMode(false);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onData = (data: string) => {
+      if (data === "\u0003") {
+        cleanup();
+        reject(new InitializationError("Initialization cancelled."));
+        return;
+      }
+      if (data === "\r" || data === "\n") {
+        cleanup();
+        process.stderr.write("\n");
+        resolve(value);
+        return;
+      }
+      if (data === "\u007f") {
+        value = value.slice(0, -1);
+        return;
+      }
+      value += data;
+    };
+    process.stdin.on("data", onData);
+    process.stdin.on("error", onError);
+  });
+};
